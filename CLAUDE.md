@@ -69,6 +69,7 @@ If you ever need a fallback, `fxtwitter.com` behaves the same way.
 ```
 .
 ├── bot.py                          # The whole bot. ~180 lines.
+├── check_feeds.py                  # Standalone diagnostic: reports which RSS mirrors are alive
 ├── requirements.txt                # feedparser, requests
 ├── .github/workflows/tweet-check.yml  # Cron schedule + run + state cache
 ├── .gitignore                      # Ignores state.json, .env, __pycache__
@@ -149,6 +150,9 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
 ```bash
 # Run the bot locally (needs the two env vars set)
 TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python bot.py
+
+# Check which RSS feed mirrors are currently alive (no secrets needed)
+python check_feeds.py
 
 # Quick syntax check
 python -c "import ast; ast.parse(open('bot.py').read()); print('OK')"

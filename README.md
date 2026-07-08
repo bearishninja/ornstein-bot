@@ -41,5 +41,8 @@ this project hands-free (Claude Code commits and pushes for you).
 - **Posting nothing?** Run the workflow manually and read the logs. Each feed
   source reports its entry count; if all show `0 entries`, the feed sources are
   down and need refreshing (see `CLAUDE.md` → Known issues).
+- **Check feed health yourself:** `pip install -r requirements.txt && python
+  check_feeds.py` — hits every feed source and prints which ones are up, down,
+  or empty. No secrets or env vars needed.
 - **Duplicates?** Shouldn't happen with the current workflow. If it does, check
   that the cache steps in the workflow still use the unique-key pattern.
