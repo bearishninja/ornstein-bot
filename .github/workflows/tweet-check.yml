@@ -1,0 +1,45 @@
+name: Tweet Forwarder
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+jobs:
+  check-tweets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore the most recent state cache (tracks which tweets we've seen).
+      # Each run saves under a unique key; restore-keys finds the latest by prefix.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: tweet-state-${{ github.run_id }}
+          restore-keys: |
+            tweet-state-
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWITTER_USERNAME: ${{ vars.TWITTER_USERNAME || 'David_Ornstein' }}
+        run: python bot.py
+
+      # Save state under a fresh unique key. Old caches auto-evict over time.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: tweet-state-${{ github.run_id }}
