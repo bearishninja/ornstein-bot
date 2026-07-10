@@ -18,14 +18,13 @@ TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "David_Ornstein")
 FEED_TIMEOUT = 12  # seconds
 
 RSS_FEEDS = [
+    f"https://nitter.net/{TWITTER_USERNAME}/rss",
+    f"https://xcancel.com/{TWITTER_USERNAME}/rss",
+    f"https://nitter.tiekoetter.com/{TWITTER_USERNAME}/rss",
+    f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
     f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
     f"https://rsshub.rssforever.com/twitter/user/{TWITTER_USERNAME}",
     f"https://rsshub.pseudoyu.com/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.ktachibana.party/twitter/user/{TWITTER_USERNAME}",
-    f"https://rss.shab.fun/twitter/user/{TWITTER_USERNAME}",
-    f"https://hub.slarker.me/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.woodland.cafe/twitter/user/{TWITTER_USERNAME}",
-    f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
     f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
 ]
 

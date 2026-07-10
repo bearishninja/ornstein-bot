@@ -7,10 +7,12 @@ Persists seen-tweet fingerprints in a local JSON file (cached between runs).
 """
 
 import os
+import re
 import json
 import time
 import logging
 import hashlib
+import calendar
 from pathlib import Path
 
 import feedparser
@@ -28,19 +30,24 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 # burst of tweets between polls, whereas a thin 1-entry feed would drop them.
 # RSSHub public instances rotate and go up/down, so we list several mirrors.
 RSS_FEEDS = [
-    # RSSHub mirrors — these typically return ~20 recent tweets (best case)
+    # Nitter instances — return ~20 recent tweets when reachable. Some block
+    # datacenter IPs (GitHub runners), so results vary by where this runs.
+    f"https://nitter.net/{TWITTER_USERNAME}/rss",
+    f"https://xcancel.com/{TWITTER_USERNAME}/rss",
+    f"https://nitter.tiekoetter.com/{TWITTER_USERNAME}/rss",
+    f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
+    # RSSHub mirrors — mostly dead as of Jul 2026, kept as cheap extra chances
     f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
     f"https://rsshub.rssforever.com/twitter/user/{TWITTER_USERNAME}",
     f"https://rsshub.pseudoyu.com/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.ktachibana.party/twitter/user/{TWITTER_USERNAME}",
-    f"https://rss.shab.fun/twitter/user/{TWITTER_USERNAME}",
-    f"https://hub.slarker.me/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.woodland.cafe/twitter/user/{TWITTER_USERNAME}",
-    # Nitter-based mirror (also multi-entry when up)
-    f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
     # Thin fallback — usually only the latest 1 tweet. Last resort only.
     f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
 ]
+
+# Never post tweets older than this. Protects against a burst of stale posts
+# when a rich feed comes back after an outage or when the source switches
+# (older entries are silently marked as seen instead).
+MAX_TWEET_AGE_HOURS = 24
 
 # Feeds that respond slower than this are skipped so one dead host can't stall
 # the whole run. GitHub Actions gives us plenty of headroom, but keep it tidy.
@@ -68,8 +75,23 @@ def save_state(seen: set):
 
 
 def fingerprint(entry) -> str:
+    """Identify a tweet by its numeric status ID so the same tweet dedupes
+    identically no matter which feed source it came from (nitter, rsshub,
+    diffbot all embed /status/<id> in their links). Falls back to hashing
+    the raw id/link/title if no status ID is found."""
     raw = entry.get("id", "") or entry.get("link", "") or entry.get("title", "")
+    m = re.search(r"/status/(\d+)", raw)
+    if m:
+        return m.group(1)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def entry_age_hours(entry) -> float | None:
+    """Age of an entry in hours, or None if the feed gave no usable date."""
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not t:
+        return None
+    return (time.time() - calendar.timegm(t)) / 3600
 
 
 # ── RSS fetching ────────────────────────────────────────────────────────────
@@ -116,13 +138,20 @@ def send_telegram(tweet_url: str):
     """Send a fixupx.com URL to the group. Telegram renders the full card
     (author, tweet text, images/video) automatically. Tapping the card
     redirects to the real x.com tweet."""
-    embed_url = (
-        tweet_url
-        .replace("https://x.com/", "https://fixupx.com/")
-        .replace("https://twitter.com/", "https://fixupx.com/")
-        .replace("http://x.com/", "https://fixupx.com/")
-        .replace("http://twitter.com/", "https://fixupx.com/")
-    )
+    # Canonicalize ANY source's link (x.com, nitter.net, xcancel.com, …) to
+    # fixupx.com/<user>/status/<id>. Never post a raw mirror URL — only the
+    # fixupx form renders the rich card (goal #1).
+    m = re.search(r"https?://[^/]+/(\w+)/status/(\d+)", tweet_url)
+    if m:
+        embed_url = f"https://fixupx.com/{m.group(1)}/status/{m.group(2)}"
+    else:
+        embed_url = (
+            tweet_url
+            .replace("https://x.com/", "https://fixupx.com/")
+            .replace("https://twitter.com/", "https://fixupx.com/")
+            .replace("http://x.com/", "https://fixupx.com/")
+            .replace("http://twitter.com/", "https://fixupx.com/")
+        )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -162,7 +191,12 @@ def main():
         log.info(f"First run — marked {len(new_entries)} existing tweets as seen (no spam).")
     else:
         sent = 0
+        skipped_stale = 0
         for entry in new_entries:
+            age = entry_age_hours(entry)
+            if age is not None and age > MAX_TWEET_AGE_HOURS:
+                skipped_stale += 1
+                continue
             link = entry.get("link", "")
             if link:
                 send_telegram(link)
@@ -170,6 +204,9 @@ def main():
                 time.sleep(1)
             else:
                 log.warning(f"Skipping entry with no link: {entry.get('title', '?')}")
+        if skipped_stale:
+            log.info(f"Marked {skipped_stale} stale entry(ies) >"
+                     f"{MAX_TWEET_AGE_HOURS}h old as seen without posting.")
         log.info(f"Done — forwarded {sent} new tweet(s).")
 
     save_state(seen)
