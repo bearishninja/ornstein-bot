@@ -133,16 +133,49 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
   hours on a `*/5` schedule (Jul 9 2026). This is GitHub's infra, not a config
   bug — and is the main motivation for the VPS migration.
 
-## Planned migration (in progress)
+## Production deployment: DigitalOcean droplet (since Jul 10 2026)
 
-The owner is getting a cheap DigitalOcean droplet (~$4-6/mo, also for other
-personal microservices). Plan: run this same `bot.py` on the droplet via a
-systemd timer (or loop) every 1-2 minutes, with `state.json` on local disk —
-no Actions cache dance, no cron flakiness, ~1-2 min latency. The data source
-stays free (nitter.net et al). Everything else (fixupx, dedup, age cutoff)
-carries over unchanged. Keep the GitHub Actions workflow running until the
-droplet version is verified, then disable the workflow (do not delete it — it
-is a fallback).
+The bot now runs on the owner's personal droplet. GitHub Actions remains as a
+disabled fallback workflow (see below).
+
+- **Droplet:** `bearishninja-services` — DigitalOcean Basic $6/mo (1GB RAM,
+  1 vCPU, 25GB SSD), Ubuntu 24.04 LTS, Bangalore region.
+- **Access:** `ssh root@168.144.155.254` (key on the owner's Mac at
+  `~/.ssh/id_ed25519`, no passphrase).
+- **Bot location:** `/opt/ornstein-bot` (git clone of this repo + venv).
+- **Secrets:** `/opt/ornstein-bot/.env` (chmod 600) — TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID, TWITTER_USERNAME. Never in the repo.
+- **Scheduling:** systemd timer `ornstein-bot.timer` fires
+  `ornstein-bot.service` (oneshot, runs `bot.py` once) **every minute**.
+  Unit files: `/etc/systemd/system/ornstein-bot.{service,timer}`.
+- **State:** `/opt/ornstein-bot/state.json` on local disk. Fingerprints are
+  numeric tweet status IDs.
+- **Box hardening (done):** ufw (OpenSSH+80+443 only), fail2ban,
+  unattended-upgrades, 1GB swapfile. The droplet also hosts (or will host)
+  the owner's other personal microservices — don't assume this bot is the
+  only thing on it.
+
+### Droplet runbook
+
+```bash
+ssh root@168.144.155.254
+
+journalctl -u ornstein-bot.service -n 50        # recent bot logs
+systemctl list-timers ornstein-bot.timer        # is the schedule alive?
+systemctl start ornstein-bot.service            # force a run now
+cd /opt/ornstein-bot && git pull                # deploy latest code
+cat /opt/ornstein-bot/state.json                # what's been seen
+systemctl stop ornstein-bot.timer               # pause posting (start to resume)
+```
+
+### GitHub Actions fallback (disabled, do not delete)
+
+The old workflow `.github/workflows/tweet-check.yml` is kept but **disabled**
+so the droplet and Actions don't double-post (their states are separate). If
+the droplet dies, re-enable it from the Actions tab (or
+`gh workflow enable tweet-check.yml`) for instant fallback coverage at
+GitHub-cron latency. Its state cache starts empty → first run safely marks
+everything seen, no spam.
 - **Do not reintroduce the old cache bug.** An earlier workflow used a fixed
   cache key `tweet-state` plus a `gh cache delete` step. That delete failed with
   HTTP 403 (default `GITHUB_TOKEN` lacks `actions: write`), so state never

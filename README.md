@@ -4,16 +4,20 @@ Forwards new tweets from [@David_Ornstein](https://x.com/David_Ornstein) into th
 **BMS FC** Telegram group, with a fully-rendered preview card (text, images,
 video) so everyone can read and reply without leaving Telegram.
 
-**Runs on GitHub Actions — no server, no cost, no Twitter API keys.**
+**Runs on a personal VPS via systemd timer — no Twitter API keys.**
 
 ---
 
 ## How it works
 
-Every 5 minutes, GitHub Actions runs `bot.py`, which checks public RSS feeds of
-Ornstein's tweets, finds any it hasn't posted yet, and sends each to the group as
-a `fixupx.com` link — which Telegram renders as a rich card. A cached
+Every minute, a systemd timer on the owner's DigitalOcean droplet runs
+`bot.py`, which checks public RSS feeds of Ornstein's tweets (nitter.net et
+al), finds any it hasn't posted yet, and sends each to the group as a
+`fixupx.com` link — which Telegram renders as a rich card. A local
 `state.json` remembers what's already been posted so nothing repeats.
+
+(An earlier GitHub Actions version is kept as a disabled fallback workflow —
+see `CLAUDE.md` for the full story and runbook.)
 
 ## Setup
 
