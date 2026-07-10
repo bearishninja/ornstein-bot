@@ -110,16 +110,39 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
 
 ## Known issues / current state
 
-- **Feed fragility is the #1 ongoing risk.** The public RSSHub/Nitter instances
-  in `RSS_FEEDS` go up and down. In past runs, only the thin `diffbot` fallback
-  (returns just 1 tweet) was working, which risks missing tweets during a burst.
-  The current `bot.py` mitigates this by querying ALL sources and keeping the one
-  with the MOST entries, and by listing many mirror instances. But if you see the
-  logs reporting `0 entries` from most/all sources, the fix is to find and add
-  fresh working RSSHub instances or move to a paid/self-hosted feed.
-- **First run after a feed upgrade may post a small batch.** When a
-  richer-than-before feed first returns ~20 tweets, any of those not yet in
-  `state.json` will be posted. Expected, not a bug.
+- **A tweet was missed on Jul 9 2026** (posted ~6.5h late after a fix): GitHub's
+  cron ran only twice in 12 hours AND all feed sources were dead simultaneously.
+  This prompted two changes: (a) the feed list was refreshed around nitter.net
+  (see below), and (b) the owner decided to migrate the bot to a personal
+  DigitalOcean VPS — see "Planned migration" below.
+- **Feed fragility is the #1 ongoing risk.** As of Jul 2026 the primary source
+  is `nitter.net` (returns ~20 tweets, verified working from both residential
+  IPs and GitHub runners). The old RSSHub mirrors are dead (404/503) but kept
+  as cheap extra chances. Use `python check_feeds.py` to see live status. If
+  nitter.net dies, check https://status.d420.de/ for fresh healthy instances.
+- **Safeguards against re-post/spam** (added Jul 2026, keep these):
+  - Fingerprints are the tweet's numeric status ID, extracted from any source's
+    link format — the same tweet dedupes identically across feed sources.
+  - `MAX_TWEET_AGE_HOURS = 24`: entries older than 24h are marked seen but
+    never posted, so a recovering rich feed can't flood the group with stale
+    news. Tradeoff: if ALL feeds are dead for >24h, that window's tweets are
+    silently dropped.
+  - `send_telegram()` canonicalizes any mirror's link (nitter.net, xcancel,
+    etc.) to `fixupx.com/<user>/status/<id>` — never post a raw mirror URL.
+- **GitHub Actions cron is unreliable in practice.** Observed: 2 runs in 12
+  hours on a `*/5` schedule (Jul 9 2026). This is GitHub's infra, not a config
+  bug — and is the main motivation for the VPS migration.
+
+## Planned migration (in progress)
+
+The owner is getting a cheap DigitalOcean droplet (~$4-6/mo, also for other
+personal microservices). Plan: run this same `bot.py` on the droplet via a
+systemd timer (or loop) every 1-2 minutes, with `state.json` on local disk —
+no Actions cache dance, no cron flakiness, ~1-2 min latency. The data source
+stays free (nitter.net et al). Everything else (fixupx, dedup, age cutoff)
+carries over unchanged. Keep the GitHub Actions workflow running until the
+droplet version is verified, then disable the workflow (do not delete it — it
+is a fallback).
 - **Do not reintroduce the old cache bug.** An earlier workflow used a fixed
   cache key `tweet-state` plus a `gh cache delete` step. That delete failed with
   HTTP 403 (default `GITHUB_TOKEN` lacks `actions: write`), so state never
