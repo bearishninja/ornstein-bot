@@ -80,7 +80,13 @@ def fingerprint(entry) -> str:
     diffbot all embed /status/<id> in their links). Falls back to hashing
     the raw id/link/title if no status ID is found."""
     raw = entry.get("id", "") or entry.get("link", "") or entry.get("title", "")
+    if raw.isdigit():  # nitter guids are the bare numeric status ID
+        return raw
     m = re.search(r"/status/(\d+)", raw)
+    if m:
+        return m.group(1)
+    # id may be an opaque guid while the link still holds /status/<id>
+    m = re.search(r"/status/(\d+)", entry.get("link", ""))
     if m:
         return m.group(1)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
