@@ -129,6 +129,15 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
      for >2h, the bot DMs the owner via `TELEGRAM_ALERT_CHAT_ID` (re-alerts
      at most daily; sends a recovery DM when sources return). If that env is
      unset, alerts are log-only. The DM goes to the owner, NEVER the group.
+  4. **Stale-feed watchdog** (added Jul 13 2026): the third-party Telegram
+     channel `t.me/David_Ornstein` (12k+ subs, mirrors the tweets as TEXT,
+     +6 to +49 min lag, no links) is polled via its `t.me/s/` web preview.
+     If its newest post is >45 min newer than the newest tweet our feeds
+     have surfaced (newest = max snowflake ID in `seen`), the owner gets a
+     DM — this catches feeds that are rich-but-STALE, which alerting #3
+     cannot see. It is NEVER a posting source (no tweet links → no fixupx
+     card, no dedup). May rarely false-alarm if the channel posts an ad
+     (rate-limited to 1 DM/day). `MIRROR_CHANNEL=` (empty) disables.
   As of Jul 2026 the richest source is `nitter.net` (~20 tweets). Use
   `python check_feeds.py` (mirrors the bot's dynamic+static list) for live
   status.

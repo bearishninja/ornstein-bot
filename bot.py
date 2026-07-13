@@ -71,7 +71,19 @@ REALERT_HOURS = 24
 # the whole run. Fetches run in parallel, so this bounds the whole fetch step.
 FEED_TIMEOUT = 12  # seconds
 
+# Independent watchdog: a third-party Telegram channel that mirrors the tweets
+# as text (no links, and slower than our feeds — measured +6 to +49 min).
+# NEVER used for posting — only to detect the "feeds are rich but STALE"
+# failure mode that source alerting can't see: if the mirror shows activity
+# meaningfully newer than the newest tweet our feeds have surfaced, DM the
+# owner. Empty env disables the watchdog.
+MIRROR_CHANNEL = os.getenv("MIRROR_CHANNEL", "David_Ornstein")
+WATCHDOG_GAP_MINUTES = 45  # > the mirror's own worst observed lag
+TWITTER_EPOCH_MS = 1288834974657  # snowflake ID → timestamp
+
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"}
+BROWSER_UA = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 Chrome/126.0 Safari/537.36")}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +103,7 @@ def load_state() -> dict:
     state.setdefault("last_rich_fetch", 0)
     state.setdefault("alert_active", False)
     state.setdefault("last_alert", 0)
+    state.setdefault("watchdog_last_alert", 0)
     return state
 
 
@@ -253,6 +266,51 @@ def send_owner_alert(text: str):
         log.error(f"Alert DM failed: {resp.status_code} {resp.text}")
 
 
+def newest_seen_tweet_time(seen: set) -> float | None:
+    """Unix time of the newest tweet we've seen, derived from the largest
+    numeric fingerprint (status IDs are snowflakes: time-ordered, and they
+    embed their creation timestamp)."""
+    ids = [int(fp) for fp in seen if fp.isdigit()]
+    if not ids:
+        return None
+    return ((max(ids) >> 22) + TWITTER_EPOCH_MS) / 1000
+
+
+def check_mirror_watchdog(state: dict, seen: set):
+    """Compare the mirror channel's newest post time against the newest tweet
+    our feeds have surfaced. A large gap means the feeds are likely serving
+    stale data (or the mirror posted an ad — hence daily rate limit)."""
+    if not MIRROR_CHANNEL:
+        return
+    try:
+        resp = requests.get(f"https://t.me/s/{MIRROR_CHANNEL}",
+                            timeout=10, headers=BROWSER_UA)
+        if not resp.ok:
+            log.info(f"Mirror watchdog: t.me/s/{MIRROR_CHANNEL} → HTTP {resp.status_code}")
+            return
+        stamps = re.findall(r'datetime="(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', resp.text)
+        ours = newest_seen_tweet_time(seen)
+        if not stamps or ours is None:
+            return
+        mirror_newest = max(
+            calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")) for s in stamps
+        )
+        gap_min = (mirror_newest - ours) / 60
+        if gap_min <= WATCHDOG_GAP_MINUTES:
+            return
+        if time.time() - state["watchdog_last_alert"] < REALERT_HOURS * 3600:
+            return
+        state["watchdog_last_alert"] = time.time()
+        send_owner_alert(
+            f"⚠️ ornstein-bot watchdog: the t.me/{MIRROR_CHANNEL} mirror has a "
+            f"post ~{gap_min:.0f} min newer than the newest tweet our feeds "
+            f"show. Feeds may be serving stale data (or the mirror posted an "
+            f"ad). Check https://x.com/{TWITTER_USERNAME} to compare."
+        )
+    except Exception as e:
+        log.info(f"Mirror watchdog skipped ({type(e).__name__}).")
+
+
 def check_feed_health(state: dict, any_rich: bool):
     """Track when we last saw a rich feed; DM the owner if it's been too long.
     Sends a recovery DM when sources come back."""
@@ -294,6 +352,8 @@ def main():
 
     if not merged:
         log.warning("Nothing to process. Exiting.")
+        if seen:
+            check_mirror_watchdog(state, seen)
         save_state(state, seen)
         return
 
@@ -326,6 +386,7 @@ def main():
             log.info(f"Marked {skipped_stale} stale entry(ies) >"
                      f"{MAX_TWEET_AGE_HOURS}h old as seen without posting.")
         log.info(f"Done — forwarded {sent} new tweet(s).")
+        check_mirror_watchdog(state, seen)
 
     save_state(state, seen)
 
