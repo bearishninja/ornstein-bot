@@ -115,11 +115,23 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
   This prompted two changes: (a) the feed list was refreshed around nitter.net
   (see below), and (b) the owner decided to migrate the bot to a personal
   DigitalOcean VPS — see "Planned migration" below.
-- **Feed fragility is the #1 ongoing risk.** As of Jul 2026 the primary source
-  is `nitter.net` (returns ~20 tweets, verified working from both residential
-  IPs and GitHub runners). The old RSSHub mirrors are dead (404/503) but kept
-  as cheap extra chances. Use `python check_feeds.py` to see live status. If
-  nitter.net dies, check https://status.d420.de/ for fresh healthy instances.
+- **Feed fragility is the #1 ongoing risk — now mitigated three ways**
+  (added Jul 13 2026):
+  1. **Dynamic discovery:** the bot refreshes its nitter instance pool from
+     the community health tracker (`status.d420.de/api/v1/instances`, healthy
+     + rss + not bad-host, top 6 by points) every 6h, cached in state.json.
+     Static fallbacks (nitter.net, xcancel, rsshub, diffbot) are always
+     appended, so a dead/poisoned tracker can't blind the bot.
+  2. **Source merging:** ALL responding feeds are fetched in parallel and
+     their valid tweets merged (dedup by status ID) — no winner-takes-all,
+     so one stale source can't hide a tweet another source already has.
+  3. **Owner alerting:** if no source returns a rich feed (≥5 valid tweets)
+     for >2h, the bot DMs the owner via `TELEGRAM_ALERT_CHAT_ID` (re-alerts
+     at most daily; sends a recovery DM when sources return). If that env is
+     unset, alerts are log-only. The DM goes to the owner, NEVER the group.
+  As of Jul 2026 the richest source is `nitter.net` (~20 tweets). Use
+  `python check_feeds.py` (mirrors the bot's dynamic+static list) for live
+  status.
 - **Safeguards against re-post/spam** (added Jul 2026, keep these):
   - `is_tweet_entry()`: only entries whose link contains `/status/<id>` are
     eligible — for posting AND for the most-entries feed contest. Added after
@@ -149,7 +161,10 @@ disabled fallback workflow (see below).
   `~/.ssh/id_ed25519`, no passphrase).
 - **Bot location:** `/opt/ornstein-bot` (git clone of this repo + venv).
 - **Secrets:** `/opt/ornstein-bot/.env` (chmod 600) — TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID, TWITTER_USERNAME. Never in the repo.
+  TELEGRAM_CHAT_ID, TWITTER_USERNAME, and optionally TELEGRAM_ALERT_CHAT_ID
+  (the owner's private chat with the bot, for outage DMs — the owner must
+  /start a private chat with @ornstein_alerts_bot once; find the chat id via
+  the Telegram getUpdates API). Never in the repo.
 - **Scheduling:** systemd timer `ornstein-bot.timer` fires
   `ornstein-bot.service` (oneshot, runs `bot.py` once) **every minute**.
   Unit files: `/etc/systemd/system/ornstein-bot.{service,timer}`.

@@ -5,28 +5,48 @@ reports how many entries each one returns right now.
 Run anytime you want to see which mirrors are alive:
     python check_feeds.py
 
-Does not touch state.json, does not post to Telegram, does not need any
-env vars or secrets — just hits the feed URLs and reports what it finds.
+Mirrors bot.py's source list: the dynamic instance pool cached in state.json
+(if present) plus the static fallbacks. Does not touch state, does not post
+to Telegram, needs no env vars or secrets.
 """
 
 import os
+import re
+import json
+from pathlib import Path
 
 import feedparser
 import requests
 
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "David_Ornstein")
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
 FEED_TIMEOUT = 12  # seconds
 
-RSS_FEEDS = [
+STATIC_FEEDS = [
     f"https://nitter.net/{TWITTER_USERNAME}/rss",
     f"https://xcancel.com/{TWITTER_USERNAME}/rss",
-    f"https://nitter.tiekoetter.com/{TWITTER_USERNAME}/rss",
     f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
     f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.rssforever.com/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.pseudoyu.com/twitter/user/{TWITTER_USERNAME}",
     f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
 ]
+
+
+def feed_urls() -> list:
+    urls = []
+    path = Path(STATE_FILE)
+    if path.exists():
+        try:
+            instances = json.loads(path.read_text()).get("instances", [])
+            urls = [f"{inst}/{TWITTER_USERNAME}/rss" for inst in instances]
+            if urls:
+                print(f"(including {len(urls)} tracker-discovered instances "
+                      f"from {STATE_FILE})\n")
+        except Exception:
+            pass
+    for u in STATIC_FEEDS:
+        if u not in urls:
+            urls.append(u)
+    return urls
 
 
 def main():
@@ -34,7 +54,7 @@ def main():
     best_count = -1
     best_url = None
 
-    for url in RSS_FEEDS:
+    for url in feed_urls():
         try:
             resp = requests.get(
                 url,
@@ -44,19 +64,25 @@ def main():
             if not resp.ok:
                 print(f"  DOWN      HTTP {resp.status_code}          {url}")
                 continue
-            count = len(feedparser.parse(resp.content).entries)
-            print(f"  {'OK' if count else 'EMPTY':<9} {count:3d} entries        {url}")
-            if count > best_count:
-                best_count = count
+            entries = feedparser.parse(resp.content).entries
+            valid = [e for e in entries
+                     if re.search(r"/status/\d+", e.get("link", "") or "")]
+            label = "OK" if valid else "EMPTY"
+            note = "" if len(valid) == len(entries) else \
+                f"  ({len(entries) - len(valid)} junk discarded)"
+            print(f"  {label:<9} {len(valid):3d} tweets        {url}{note}")
+            if len(valid) > best_count:
+                best_count = len(valid)
                 best_url = url
         except Exception as e:
             print(f"  FAIL      {type(e).__name__:<20} {url}")
 
     print()
-    if best_url:
-        print(f"bot.py would currently use: {best_url} ({best_count} entries)")
+    if best_url and best_count > 0:
+        print(f"Richest source right now: {best_url} ({best_count} tweets)")
+        print("(bot.py merges ALL live sources, not just the richest)")
     else:
-        print("bot.py would currently find nothing — all feeds are down.")
+        print("No source is returning tweets — the bot is blind right now.")
 
 
 if __name__ == "__main__":

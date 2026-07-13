@@ -1,9 +1,17 @@
 """
 Telegram bot that forwards tweets from @David_Ornstein to a Telegram group.
 
-Designed to run as a single invocation (e.g. via GitHub Actions cron).
-Uses RSS feeds — no Twitter API keys needed.
-Persists seen-tweet fingerprints in a local JSON file (cached between runs).
+Designed to run as a single invocation (systemd timer on the droplet, or
+GitHub Actions cron as fallback). Uses RSS feeds — no Twitter API keys needed.
+Persists seen-tweet fingerprints and operational state in a local JSON file.
+
+Resilience model (Jul 2026):
+- Feed instance list is refreshed from the community nitter health tracker
+  (status.d420.de) every few hours, cached in state; static list as fallback.
+- ALL sources are queried in parallel and their valid tweets MERGED (dedup by
+  status ID) — no single feed is a point of failure or freshness bottleneck.
+- If no source returns a rich feed for ALERT_AFTER_HOURS, the bot DMs the
+  owner (TELEGRAM_ALERT_CHAT_ID) — silence must not look like health.
 """
 
 import os
@@ -14,6 +22,7 @@ import logging
 import hashlib
 import calendar
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import feedparser
 import requests
@@ -22,25 +31,27 @@ import requests
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# Optional: owner's private chat with the bot, for outage alerts (NOT the
+# group). If unset, alerts only appear in the logs.
+TELEGRAM_ALERT_CHAT_ID = os.getenv("TELEGRAM_ALERT_CHAT_ID", "")
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "David_Ornstein")
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# RSS feed sources to try. We query ALL of them and use whichever returns the
-# MOST entries — a full-batch feed (~20 tweets) protects against missing a
-# burst of tweets between polls, whereas a thin 1-entry feed would drop them.
-# RSSHub public instances rotate and go up/down, so we list several mirrors.
-RSS_FEEDS = [
-    # Nitter instances — return ~20 recent tweets when reachable. Some block
-    # datacenter IPs (GitHub runners), so results vary by where this runs.
+# Community-run health tracker for nitter instances. We pull healthy
+# RSS-capable instances from here so the bot discovers replacements itself
+# when instances die. Fail-soft: cached list, then static list.
+INSTANCE_TRACKER_API = "https://status.d420.de/api/v1/instances"
+INSTANCE_REFRESH_HOURS = 6
+MAX_DYNAMIC_INSTANCES = 6
+
+# Static fallbacks, used alongside whatever the tracker provides.
+STATIC_FEEDS = [
     f"https://nitter.net/{TWITTER_USERNAME}/rss",
     f"https://xcancel.com/{TWITTER_USERNAME}/rss",
-    f"https://nitter.tiekoetter.com/{TWITTER_USERNAME}/rss",
     f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
     # RSSHub mirrors — mostly dead as of Jul 2026, kept as cheap extra chances
     f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.rssforever.com/twitter/user/{TWITTER_USERNAME}",
-    f"https://rsshub.pseudoyu.com/twitter/user/{TWITTER_USERNAME}",
-    # Thin fallback — usually only the latest 1 tweet. Last resort only.
+    # Thin scraper fallback; its junk entries are filtered by is_tweet_entry()
     f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
 ]
 
@@ -49,9 +60,18 @@ RSS_FEEDS = [
 # (older entries are silently marked as seen instead).
 MAX_TWEET_AGE_HOURS = 24
 
+# A source counts as "rich" when it returns at least this many valid tweets.
+# If NO source is rich for ALERT_AFTER_HOURS, the owner gets a Telegram DM
+# (re-sent at most once per REALERT_HOURS while the outage lasts).
+RICH_FEED_MIN_TWEETS = 5
+ALERT_AFTER_HOURS = 2
+REALERT_HOURS = 24
+
 # Feeds that respond slower than this are skipped so one dead host can't stall
-# the whole run. GitHub Actions gives us plenty of headroom, but keep it tidy.
+# the whole run. Fetches run in parallel, so this bounds the whole fetch step.
 FEED_TIMEOUT = 12  # seconds
+
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,17 +81,22 @@ log = logging.getLogger(__name__)
 
 # ── State persistence ───────────────────────────────────────────────────────
 
-def load_state() -> set:
+def load_state() -> dict:
+    """State is a dict; older state files that only had 'seen' still load."""
     path = Path(STATE_FILE)
-    if path.exists():
-        data = json.loads(path.read_text())
-        return set(data.get("seen", []))
-    return set()
+    state = json.loads(path.read_text()) if path.exists() else {}
+    state.setdefault("seen", [])
+    state.setdefault("instances", [])
+    state.setdefault("instances_fetched_at", 0)
+    state.setdefault("last_rich_fetch", 0)
+    state.setdefault("alert_active", False)
+    state.setdefault("last_alert", 0)
+    return state
 
 
-def save_state(seen: set):
-    recent = list(seen)[-500:]
-    Path(STATE_FILE).write_text(json.dumps({"seen": recent}))
+def save_state(state: dict, seen: set):
+    state["seen"] = list(seen)[-500:]
+    Path(STATE_FILE).write_text(json.dumps(state))
 
 
 def fingerprint(entry) -> str:
@@ -104,54 +129,89 @@ def is_tweet_entry(entry) -> bool:
     """Only entries whose link is an actual tweet permalink count. Scrapers
     (diffbot especially) sometimes return a login/landing page's furniture —
     help links, signup links, t.co redirects — as feed entries. Those must
-    never be posted and must never win the most-entries feed contest.
+    never be posted and must never influence source selection.
     (Incident: 3 junk links posted to the group on Jul 13 2026.)"""
     return bool(re.search(r"/status/\d+", entry.get("link", "") or ""))
 
 
+# ── Feed discovery ──────────────────────────────────────────────────────────
+
+def refresh_instances(state: dict):
+    """Refresh the nitter instance pool from the community health tracker.
+    Fail-soft: on any problem we keep the cached list (and always merge with
+    STATIC_FEEDS later, so an empty/poisoned tracker can't blind the bot)."""
+    fresh_for = time.time() - state["instances_fetched_at"]
+    if state["instances"] and fresh_for < INSTANCE_REFRESH_HOURS * 3600:
+        return
+    try:
+        resp = requests.get(INSTANCE_TRACKER_API, timeout=10, headers=USER_AGENT)
+        resp.raise_for_status()
+        hosts = resp.json().get("hosts", [])
+        good = [
+            h["url"].rstrip("/")
+            for h in sorted(hosts, key=lambda h: h.get("points") or 0, reverse=True)
+            if h.get("healthy") and h.get("rss") and not h.get("is_bad_host")
+        ]
+        if good:
+            state["instances"] = good[:MAX_DYNAMIC_INSTANCES]
+            state["instances_fetched_at"] = time.time()
+            log.info(f"Instance pool refreshed from tracker: {state['instances']}")
+        else:
+            log.warning("Tracker returned no healthy RSS instances; keeping cache.")
+    except Exception as e:
+        log.info(f"Instance tracker unavailable ({type(e).__name__}); "
+                 f"using cached/static list.")
+
+
+def build_feed_urls(state: dict) -> list:
+    """Dynamic instances first, then static fallbacks, deduped."""
+    urls = [f"{inst}/{TWITTER_USERNAME}/rss" for inst in state["instances"]]
+    for u in STATIC_FEEDS:
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
 # ── RSS fetching ────────────────────────────────────────────────────────────
 
-def fetch_feed() -> list:
-    """Query every source and return the entries from whichever gave the MOST.
-
-    Preferring the largest result set means a full-batch feed (~20 tweets)
-    always wins over a thin 1-entry fallback, so a burst of tweets posted
-    between polls won't be silently dropped.
-    """
-    best_entries: list = []
-    best_url = None
-
-    for url in RSS_FEEDS:
-        try:
-            resp = requests.get(
-                url,
-                timeout=FEED_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"},
-            )
-            if not resp.ok:
-                log.info(f"  {url} → HTTP {resp.status_code}, skipping")
-                continue
-            feed = feedparser.parse(resp.content)
-            tweets = [e for e in feed.entries if is_tweet_entry(e)]
-            if len(tweets) != len(feed.entries):
-                log.info(f"  {url} → {len(feed.entries)} entries "
-                         f"({len(tweets)} valid tweets, rest discarded)")
-            else:
-                log.info(f"  {url} → {len(tweets)} entries")
-            if len(tweets) > len(best_entries):
-                best_entries = tweets
-                best_url = url
-        except Exception as e:
-            log.info(f"  {url} → failed ({type(e).__name__}), skipping")
-
-    if best_url:
-        log.info(f"Using {len(best_entries)} entries from {best_url}")
-    else:
-        log.warning("No feed source returned any entries this cycle.")
-    return best_entries
+def fetch_one(url: str):
+    """Fetch one feed; returns (status_line, valid_tweet_entries)."""
+    try:
+        resp = requests.get(url, timeout=FEED_TIMEOUT, headers=USER_AGENT)
+        if not resp.ok:
+            return f"HTTP {resp.status_code}, skipping", []
+        feed = feedparser.parse(resp.content)
+        tweets = [e for e in feed.entries if is_tweet_entry(e)]
+        if len(tweets) != len(feed.entries):
+            return (f"{len(feed.entries)} entries "
+                    f"({len(tweets)} valid tweets, rest discarded)", tweets)
+        return f"{len(tweets)} entries", tweets
+    except Exception as e:
+        return f"failed ({type(e).__name__}), skipping", []
 
 
-# ── Telegram posting ───────────────────────────────────────────────────────
+def fetch_all_feeds(urls: list) -> tuple[dict, bool]:
+    """Query every source in parallel and MERGE their valid tweets, deduped
+    by fingerprint. Merging (vs picking one winner) means a single stale or
+    blipping source can't hide a tweet another source already has.
+
+    Returns (fingerprint -> entry map, whether any source was rich)."""
+    merged: dict = {}
+    any_rich = False
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(fetch_one, urls))
+    for url, (status_line, tweets) in zip(urls, results):
+        log.info(f"  {url} → {status_line}")
+        if len(tweets) >= RICH_FEED_MIN_TWEETS:
+            any_rich = True
+        for entry in tweets:
+            merged.setdefault(fingerprint(entry), entry)
+    log.info(f"Merged {len(merged)} unique tweets "
+             f"from {sum(1 for _, t in results if t)} live source(s).")
+    return merged, any_rich
+
+
+# ── Telegram ────────────────────────────────────────────────────────────────
 
 def send_telegram(tweet_url: str):
     """Send a fixupx.com URL to the group. Telegram renders the full card
@@ -172,10 +232,7 @@ def send_telegram(tweet_url: str):
             .replace("http://twitter.com/", "https://fixupx.com/")
         )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": embed_url,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": embed_url}
     resp = requests.post(url, json=payload, timeout=15)
     if not resp.ok:
         log.error(f"Telegram API error: {resp.status_code} {resp.text}")
@@ -183,28 +240,70 @@ def send_telegram(tweet_url: str):
         log.info(f"Posted to Telegram: {embed_url}")
 
 
+def send_owner_alert(text: str):
+    """DM the owner (never the group). Logs-only if no alert chat configured."""
+    if not TELEGRAM_ALERT_CHAT_ID:
+        log.warning(f"ALERT (set TELEGRAM_ALERT_CHAT_ID for DMs): {text}")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url, json={"chat_id": TELEGRAM_ALERT_CHAT_ID, "text": text}, timeout=15
+    )
+    if not resp.ok:
+        log.error(f"Alert DM failed: {resp.status_code} {resp.text}")
+
+
+def check_feed_health(state: dict, any_rich: bool):
+    """Track when we last saw a rich feed; DM the owner if it's been too long.
+    Sends a recovery DM when sources come back."""
+    now = time.time()
+    if any_rich:
+        state["last_rich_fetch"] = now
+        if state["alert_active"]:
+            state["alert_active"] = False
+            send_owner_alert("✅ ornstein-bot: tweet sources recovered.")
+        return
+    if not state["last_rich_fetch"]:
+        # Fresh state: start the clock now rather than alerting immediately.
+        state["last_rich_fetch"] = now
+        return
+    hours_blind = (now - state["last_rich_fetch"]) / 3600
+    realert_due = (now - state["last_alert"]) > REALERT_HOURS * 3600
+    if hours_blind > ALERT_AFTER_HOURS and (not state["alert_active"] or realert_due):
+        state["alert_active"] = True
+        state["last_alert"] = now
+        send_owner_alert(
+            f"⚠️ ornstein-bot: no rich tweet feed for {hours_blind:.1f}h — "
+            f"all sources may be dead. Check `python check_feeds.py` on the "
+            f"droplet, and https://status.d420.de/ for fresh instances."
+        )
+
+
 # ── Single run ─────────────────────────────────────────────────────────────
 
 def main():
     log.info(f"Checking @{TWITTER_USERNAME} for new tweets…")
 
-    seen = load_state()
+    state = load_state()
+    seen = set(state["seen"])
     first_run = len(seen) == 0
 
-    entries = fetch_feed()
+    refresh_instances(state)
+    merged, any_rich = fetch_all_feeds(build_feed_urls(state))
+    check_feed_health(state, any_rich)
 
-    if not entries:
+    if not merged:
         log.warning("Nothing to process. Exiting.")
-        save_state(seen)
+        save_state(state, seen)
         return
 
-    # Process oldest-first so Telegram messages arrive in chronological order
+    # Oldest-first so Telegram messages arrive in chronological order.
+    # Status IDs are snowflakes (time-ordered), so sorting by ID is exact.
     new_entries = []
-    for entry in reversed(entries):
-        fp = fingerprint(entry)
+    for fp in sorted(merged, key=lambda f: int(f) if f.isdigit() else 0):
         if fp not in seen:
             seen.add(fp)
-            new_entries.append(entry)
+            new_entries.append(merged[fp])
 
     if first_run:
         log.info(f"First run — marked {len(new_entries)} existing tweets as seen (no spam).")
@@ -228,7 +327,7 @@ def main():
                      f"{MAX_TWEET_AGE_HOURS}h old as seen without posting.")
         log.info(f"Done — forwarded {sent} new tweet(s).")
 
-    save_state(seen)
+    save_state(state, seen)
 
 
 if __name__ == "__main__":
