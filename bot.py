@@ -100,6 +100,15 @@ def entry_age_hours(entry) -> float | None:
     return (time.time() - calendar.timegm(t)) / 3600
 
 
+def is_tweet_entry(entry) -> bool:
+    """Only entries whose link is an actual tweet permalink count. Scrapers
+    (diffbot especially) sometimes return a login/landing page's furniture —
+    help links, signup links, t.co redirects — as feed entries. Those must
+    never be posted and must never win the most-entries feed contest.
+    (Incident: 3 junk links posted to the group on Jul 13 2026.)"""
+    return bool(re.search(r"/status/\d+", entry.get("link", "") or ""))
+
+
 # ── RSS fetching ────────────────────────────────────────────────────────────
 
 def fetch_feed() -> list:
@@ -123,10 +132,14 @@ def fetch_feed() -> list:
                 log.info(f"  {url} → HTTP {resp.status_code}, skipping")
                 continue
             feed = feedparser.parse(resp.content)
-            count = len(feed.entries)
-            log.info(f"  {url} → {count} entries")
-            if count > len(best_entries):
-                best_entries = feed.entries
+            tweets = [e for e in feed.entries if is_tweet_entry(e)]
+            if len(tweets) != len(feed.entries):
+                log.info(f"  {url} → {len(feed.entries)} entries "
+                         f"({len(tweets)} valid tweets, rest discarded)")
+            else:
+                log.info(f"  {url} → {len(tweets)} entries")
+            if len(tweets) > len(best_entries):
+                best_entries = tweets
                 best_url = url
         except Exception as e:
             log.info(f"  {url} → failed ({type(e).__name__}), skipping")

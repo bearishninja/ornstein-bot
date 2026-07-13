@@ -121,6 +121,11 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
   as cheap extra chances. Use `python check_feeds.py` to see live status. If
   nitter.net dies, check https://status.d420.de/ for fresh healthy instances.
 - **Safeguards against re-post/spam** (added Jul 2026, keep these):
+  - `is_tweet_entry()`: only entries whose link contains `/status/<id>` are
+    eligible — for posting AND for the most-entries feed contest. Added after
+    a Jul 13 2026 incident: nitter blipped for one cycle, diffbot won with 4
+    "entries" that were actually X login-page furniture (help/signup/t.co
+    links), and 3 junk messages hit the group.
   - Fingerprints are the tweet's numeric status ID, extracted from any source's
     link format — the same tweet dedupes identically across feed sources.
   - `MAX_TWEET_AGE_HOURS = 24`: entries older than 24h are marked seen but
