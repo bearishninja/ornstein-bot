@@ -203,6 +203,20 @@ cat /opt/ornstein-bot/state.json                # what's been seen
 systemctl stop ornstein-bot.timer               # pause posting (start to resume)
 ```
 
+**Before ANY manual intervention that posts or edits state.json** (e.g.
+manually pushing a missed tweet), pause the schedule AND wait out any
+in-flight run — stopping the timer does NOT stop a run already started:
+
+```bash
+systemctl stop ornstein-bot.timer
+while systemctl is-active -q ornstein-bot.service; do sleep 1; done
+# ...now safe to post manually / edit state.json...
+systemctl start ornstein-bot.timer
+```
+
+(Learned Jul 15 2026: a manual salvage post raced an in-flight run that had
+loaded pre-edit state — the group got the same tweet twice, seconds apart.)
+
 ### GitHub Actions fallback (disabled, do not delete)
 
 The old workflow `.github/workflows/tweet-check.yml` is kept but **disabled**
