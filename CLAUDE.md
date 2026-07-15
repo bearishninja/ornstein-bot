@@ -119,12 +119,18 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
   (added Jul 13 2026):
   1. **Dynamic discovery:** the bot refreshes its nitter instance pool from
      the community health tracker (`status.d420.de/api/v1/instances`, healthy
-     + rss + not bad-host, top 6 by points) every 6h, cached in state.json.
-     Static fallbacks (nitter.net, xcancel, rsshub, diffbot) are always
-     appended, so a dead/poisoned tracker can't blind the bot.
-  2. **Source merging:** ALL responding feeds are fetched in parallel and
-     their valid tweets merged (dedup by status ID) — no winner-takes-all,
-     so one stale source can't hide a tweet another source already has.
+     + not bad-host — the rss flag is NOT required, see #2 — top 6 by
+     points) every 6h, cached in state.json. Static fallbacks (nitter.net,
+     xcancel, rsshub, diffbot) are always appended, so a dead/poisoned
+     tracker can't blind the bot.
+  2. **Dual-mode source merging:** every instance is fetched BOTH as RSS and
+     as an HTML timeline (`tweet-link` anchors only — `quote-link` anchors
+     are embedded quoted tweets and are excluded; timestamps derived from
+     snowflake IDs). All responding sources are fetched in parallel and
+     their valid tweets merged (dedup by status ID) — no winner-takes-all.
+     Added after the Jul 15 2026 incident: nitter.net's RSS went
+     rich-but-STALE for 27h+ (a fresh EXCL was posted manually, ~7 min
+     late), while rss-less nitter.kareem.one had it fresh in HTML.
   3. **Owner alerting:** if no source returns a rich feed (≥5 valid tweets)
      for >2h, the bot DMs the owner via `TELEGRAM_ALERT_CHAT_ID` (re-alerts
      at most daily; sends a recovery DM when sources return). If that env is

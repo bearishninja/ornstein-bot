@@ -160,10 +160,12 @@ def refresh_instances(state: dict):
         resp = requests.get(INSTANCE_TRACKER_API, timeout=10, headers=USER_AGENT)
         resp.raise_for_status()
         hosts = resp.json().get("hosts", [])
+        # Healthy instances regardless of the rss flag: instances without RSS
+        # still serve scrapeable HTML timelines (we consume both).
         good = [
             h["url"].rstrip("/")
             for h in sorted(hosts, key=lambda h: h.get("points") or 0, reverse=True)
-            if h.get("healthy") and h.get("rss") and not h.get("is_bad_host")
+            if h.get("healthy") and not h.get("is_bad_host")
         ]
         if good:
             state["instances"] = good[:MAX_DYNAMIC_INSTANCES]
@@ -176,20 +178,55 @@ def refresh_instances(state: dict):
                  f"using cached/static list.")
 
 
-def build_feed_urls(state: dict) -> list:
-    """Dynamic instances first, then static fallbacks, deduped."""
-    urls = [f"{inst}/{TWITTER_USERNAME}/rss" for inst in state["instances"]]
+def build_sources(state: dict) -> list:
+    """(kind, url) pairs: every instance is tried BOTH as RSS and as an HTML
+    timeline (instances without RSS still serve scrapeable HTML — that is
+    what caught the Jul 15 2026 stale-nitter.net incident). Dynamic
+    instances first, then static fallbacks, deduped."""
+    sources = []
+    for inst in state["instances"]:
+        sources.append(("rss", f"{inst}/{TWITTER_USERNAME}/rss"))
+        sources.append(("html", f"{inst}/{TWITTER_USERNAME}"))
     for u in STATIC_FEEDS:
-        if u not in urls:
-            urls.append(u)
-    return urls
+        if ("rss", u) not in sources:
+            sources.append(("rss", u))
+    return sources
 
 
 # ── RSS fetching ────────────────────────────────────────────────────────────
 
-def fetch_one(url: str):
-    """Fetch one feed; returns (status_line, valid_tweet_entries)."""
+def parse_nitter_html(content: str) -> list:
+    """Extract timeline tweets from a nitter instance's profile HTML page.
+    Only `tweet-link` anchors (the timeline items' own permalinks) count —
+    `quote-link` anchors are embedded QUOTED tweets and must be excluded.
+    Timestamps derive from the snowflake ID. Returns feedparser-like dicts."""
+    entries = []
+    seen_ids = set()
+    for user, sid in re.findall(
+        r'class="tweet-link" href="/([A-Za-z0-9_]+)/status/(\d+)', content
+    ):
+        if sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        ts = ((int(sid) >> 22) + TWITTER_EPOCH_MS) / 1000
+        entries.append({
+            "id": sid,
+            "link": f"https://x.com/{user}/status/{sid}",
+            "published_parsed": time.gmtime(ts),
+        })
+    return entries
+
+
+def fetch_one(source: tuple):
+    """Fetch one (kind, url) source; returns (status_line, valid_tweet_entries)."""
+    kind, url = source
     try:
+        if kind == "html":
+            resp = requests.get(url, timeout=FEED_TIMEOUT, headers=BROWSER_UA)
+            if not resp.ok:
+                return f"HTTP {resp.status_code}, skipping", []
+            tweets = parse_nitter_html(resp.text)
+            return f"{len(tweets)} timeline tweets", tweets
         resp = requests.get(url, timeout=FEED_TIMEOUT, headers=USER_AGENT)
         if not resp.ok:
             return f"HTTP {resp.status_code}, skipping", []
@@ -203,7 +240,7 @@ def fetch_one(url: str):
         return f"failed ({type(e).__name__}), skipping", []
 
 
-def fetch_all_feeds(urls: list) -> tuple[dict, bool]:
+def fetch_all_feeds(sources: list) -> tuple[dict, bool]:
     """Query every source in parallel and MERGE their valid tweets, deduped
     by fingerprint. Merging (vs picking one winner) means a single stale or
     blipping source can't hide a tweet another source already has.
@@ -212,9 +249,9 @@ def fetch_all_feeds(urls: list) -> tuple[dict, bool]:
     merged: dict = {}
     any_rich = False
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(fetch_one, urls))
-    for url, (status_line, tweets) in zip(urls, results):
-        log.info(f"  {url} → {status_line}")
+        results = list(pool.map(fetch_one, sources))
+    for (kind, url), (status_line, tweets) in zip(sources, results):
+        log.info(f"  [{kind}] {url} → {status_line}")
         if len(tweets) >= RICH_FEED_MIN_TWEETS:
             any_rich = True
         for entry in tweets:
@@ -347,7 +384,7 @@ def main():
     first_run = len(seen) == 0
 
     refresh_instances(state)
-    merged, any_rich = fetch_all_feeds(build_feed_urls(state))
+    merged, any_rich = fetch_all_feeds(build_sources(state))
     check_feed_health(state, any_rich)
 
     if not merged:
