@@ -118,11 +118,15 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
 - **Feed fragility is the #1 ongoing risk — now mitigated three ways**
   (added Jul 13 2026):
   1. **Dynamic discovery:** the bot refreshes its nitter instance pool from
-     the community health tracker (`status.d420.de/api/v1/instances`, healthy
-     + not bad-host — the rss flag is NOT required, see #2 — top 6 by
-     points) every 6h, cached in state.json. Static fallbacks (nitter.net,
-     xcancel, rsshub, diffbot) are always appended, so a dead/poisoned
-     tracker can't blind the bot.
+     the community health tracker (`status.d420.de/api/v1/instances`, ALL
+     healthy + not bad-host instances — the rss flag is NOT required, see
+     #2, and there is NO top-N cutoff) every 1h, cached in state.json.
+     Static fallbacks (nitter.net, xcancel, rsshub, diffbot) are always
+     appended, so a dead/poisoned tracker can't blind the bot. A watchdog
+     alert (#4) also forces an immediate pool refresh. (Jul 16 2026
+     incident: a 6h-old top-6 snapshot excluded kareem.one — the only
+     fresh instance — while every pooled source was stale; caught by the
+     watchdog in ~5 min, tweet salvaged manually ~10 min late.)
   2. **Dual-mode source merging:** every instance is fetched BOTH as RSS and
      as an HTML timeline (`tweet-link` anchors only — `quote-link` anchors
      are embedded quoted tweets and are excluded; timestamps derived from
