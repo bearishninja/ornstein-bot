@@ -41,8 +41,11 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 # RSS-capable instances from here so the bot discovers replacements itself
 # when instances die. Fail-soft: cached list, then static list.
 INSTANCE_TRACKER_API = "https://status.d420.de/api/v1/instances"
-INSTANCE_REFRESH_HOURS = 6
-MAX_DYNAMIC_INSTANCES = 6
+# Hourly (not 6h): a 6h-old pool snapshot excluded the one fresh instance
+# for hours on Jul 16 2026 while every pooled instance was stale/blind.
+INSTANCE_REFRESH_HOURS = 1
+# No top-N cutoff — take every healthy instance. ~2 req/min per instance
+# (rss+html) is polite, and the excluded instance is always the one you need.
 
 # Static fallbacks, used alongside whatever the tracker provides.
 STATIC_FEEDS = [
@@ -168,7 +171,7 @@ def refresh_instances(state: dict):
             if h.get("healthy") and not h.get("is_bad_host")
         ]
         if good:
-            state["instances"] = good[:MAX_DYNAMIC_INSTANCES]
+            state["instances"] = good
             state["instances_fetched_at"] = time.time()
             log.info(f"Instance pool refreshed from tracker: {state['instances']}")
         else:
@@ -338,11 +341,15 @@ def check_mirror_watchdog(state: dict, seen: set):
         if time.time() - state["watchdog_last_alert"] < REALERT_HOURS * 3600:
             return
         state["watchdog_last_alert"] = time.time()
+        # Self-heal attempt: force a pool refresh next cycle — staleness is
+        # often a pool-snapshot problem (fresh instance excluded, Jul 16 2026).
+        state["instances_fetched_at"] = 0
         send_owner_alert(
             f"⚠️ ornstein-bot watchdog: the t.me/{MIRROR_CHANNEL} mirror has a "
             f"post ~{gap_min:.0f} min newer than the newest tweet our feeds "
             f"show. Feeds may be serving stale data (or the mirror posted an "
-            f"ad). Check https://x.com/{TWITTER_USERNAME} to compare."
+            f"ad). Instance pool refresh forced. Check "
+            f"https://x.com/{TWITTER_USERNAME} to compare."
         )
     except Exception as e:
         log.info(f"Mirror watchdog skipped ({type(e).__name__}).")
