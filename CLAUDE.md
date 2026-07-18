@@ -193,6 +193,10 @@ disabled fallback workflow (see below).
   unattended-upgrades, 1GB swapfile. The droplet also hosts (or will host)
   the owner's other personal microservices — don't assume this bot is the
   only thing on it.
+- **Box-wide conventions & services inventory:** the `bearishninja/vps`
+  repo (private; `/opt/vps/VPS.md` on the droplet, symlinked at
+  `/opt/VPS.md`). New services follow those conventions; this bot is one
+  inventory row there.
 
 ### Droplet runbook
 
