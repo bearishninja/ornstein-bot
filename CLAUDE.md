@@ -157,6 +157,19 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
     a Jul 13 2026 incident: nitter blipped for one cycle, diffbot won with 4
     "entries" that were actually X login-page furniture (help/signup/t.co
     links), and 3 junk messages hit the group.
+  - **Reply filtering** (added Jul 22 2026 after two of Ornstein's
+    credit-replies hit the group): the group wants scoops and RTs, NOT
+    reply-thread chatter. Three layers, because no single source sees all
+    replies: (1) nitter RSS titles replies "R to @user:" — covers replies
+    to others AND self-thread replies; (2) nitter HTML marks replies to
+    others with a `replying-to` class — but NOT self-replies; (3) before
+    actually posting, `is_reply_via_api()` confirms via
+    `api.fxtwitter.com/status/<id>` (fail-OPEN: if that API is down, post
+    anyway — a missed scoop is worse than a stray reply). Reply flags stick
+    through the merge (an unflagged HTML copy must not launder the RSS
+    flag). Tradeoff, deliberate: substantive self-thread CONTINUATIONS are
+    also skipped — the group reads the original scoop and can tap through.
+    Replies are marked seen, so they never resurface.
   - Fingerprints are the tweet's numeric status ID, extracted from any source's
     link format — the same tweet dedupes identically across feed sources.
   - `MAX_TWEET_AGE_HOURS = 24`: entries older than 24h are marked seen but

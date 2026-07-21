@@ -202,12 +202,19 @@ def parse_nitter_html(content: str) -> list:
     """Extract timeline tweets from a nitter instance's profile HTML page.
     Only `tweet-link` anchors (the timeline items' own permalinks) count —
     `quote-link` anchors are embedded QUOTED tweets and must be excluded.
-    Timestamps derive from the snowflake ID. Returns feedparser-like dicts."""
+    Timestamps derive from the snowflake ID. Returns feedparser-like dicts.
+
+    Items carrying a `replying-to` marker are flagged is_reply. NOTE: nitter
+    HTML only marks replies to OTHERS — self-thread replies look like normal
+    tweets here; those are caught by the RSS title flag and the fxtwitter
+    check in main()."""
     entries = []
     seen_ids = set()
-    for user, sid in re.findall(
-        r'class="tweet-link" href="/([A-Za-z0-9_]+)/status/(\d+)', content
-    ):
+    for item in re.split(r'class="timeline-item', content)[1:]:
+        m = re.search(r'class="tweet-link" href="/([A-Za-z0-9_]+)/status/(\d+)', item)
+        if not m:
+            continue
+        user, sid = m.group(1), m.group(2)
         if sid in seen_ids:
             continue
         seen_ids.add(sid)
@@ -216,6 +223,7 @@ def parse_nitter_html(content: str) -> list:
             "id": sid,
             "link": f"https://x.com/{user}/status/{sid}",
             "published_parsed": time.gmtime(ts),
+            "is_reply": 'class="replying-to"' in item or "replying-to" in item,
         })
     return entries
 
@@ -235,6 +243,10 @@ def fetch_one(source: tuple):
             return f"HTTP {resp.status_code}, skipping", []
         feed = feedparser.parse(resp.content)
         tweets = [e for e in feed.entries if is_tweet_entry(e)]
+        for e in tweets:
+            # Nitter RSS titles replies "R to @user: …" — covers BOTH replies
+            # to others and self-thread replies (which HTML cannot see).
+            e["is_reply"] = (e.get("title") or "").startswith("R to ")
         if len(tweets) != len(feed.entries):
             return (f"{len(feed.entries)} entries "
                     f"({len(tweets)} valid tweets, rest discarded)", tweets)
@@ -258,7 +270,14 @@ def fetch_all_feeds(sources: list) -> tuple[dict, bool]:
         if len(tweets) >= RICH_FEED_MIN_TWEETS:
             any_rich = True
         for entry in tweets:
-            merged.setdefault(fingerprint(entry), entry)
+            fp = fingerprint(entry)
+            if fp in merged:
+                # A reply flag from ANY source sticks — an HTML source that
+                # can't see self-replies must not launder the RSS flag away.
+                if entry.get("is_reply") and not merged[fp].get("is_reply"):
+                    merged[fp]["is_reply"] = True
+            else:
+                merged[fp] = entry
     log.info(f"Merged {len(merged)} unique tweets "
              f"from {sum(1 for _, t in results if t)} live source(s).")
     return merged, any_rich
@@ -304,6 +323,21 @@ def send_owner_alert(text: str):
     )
     if not resp.ok:
         log.error(f"Alert DM failed: {resp.status_code} {resp.text}")
+
+
+def is_reply_via_api(status_id: str) -> bool:
+    """Last-line reply check against the fxtwitter API (same FixTweet project
+    as our card renderer). Only called for tweets about to be POSTED, so at
+    most a couple of calls per real event. Fail-OPEN: if the API is down we
+    post anyway — missing a scoop is worse than a rare stray reply."""
+    try:
+        resp = requests.get(f"https://api.fxtwitter.com/status/{status_id}",
+                            timeout=8, headers=USER_AGENT)
+        if not resp.ok:
+            return False
+        return bool(resp.json().get("tweet", {}).get("replying_to"))
+    except Exception:
+        return False
 
 
 def newest_seen_tweet_time(seen: set) -> float | None:
@@ -414,21 +448,30 @@ def main():
     else:
         sent = 0
         skipped_stale = 0
+        skipped_replies = 0
         for entry in new_entries:
             age = entry_age_hours(entry)
             if age is not None and age > MAX_TWEET_AGE_HOURS:
                 skipped_stale += 1
                 continue
             link = entry.get("link", "")
-            if link:
-                send_telegram(link)
-                sent += 1
-                time.sleep(1)
-            else:
+            if not link:
                 log.warning(f"Skipping entry with no link: {entry.get('title', '?')}")
+                continue
+            # The group wants scoops and RTs, not reply-thread chatter
+            # (incident Jul 21 2026: two credit-replies posted). Source flags
+            # first, fxtwitter confirmation as the last line.
+            if entry.get("is_reply") or is_reply_via_api(fingerprint(entry)):
+                skipped_replies += 1
+                continue
+            send_telegram(link)
+            sent += 1
+            time.sleep(1)
         if skipped_stale:
             log.info(f"Marked {skipped_stale} stale entry(ies) >"
                      f"{MAX_TWEET_AGE_HOURS}h old as seen without posting.")
+        if skipped_replies:
+            log.info(f"Skipped {skipped_replies} reply(ies) — marked seen, not posted.")
         log.info(f"Done — forwarded {sent} new tweet(s).")
         check_mirror_watchdog(state, seen)
 
