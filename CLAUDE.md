@@ -196,7 +196,18 @@ disabled fallback workflow (see below).
   TELEGRAM_CHAT_ID, TWITTER_USERNAME, and optionally TELEGRAM_ALERT_CHAT_ID
   (the owner's private chat with the bot, for outage DMs — the owner must
   /start a private chat with @ornstein_alerts_bot once; find the chat id via
-  the Telegram getUpdates API). Never in the repo.
+  the Telegram getUpdates API) and HEALTHCHECK_URL (see below). Never in
+  the repo.
+- **External heartbeat** (added Aug 3 2026): `ping_heartbeat()` hits the
+  healthchecks.io URL in `HEALTHCHECK_URL` after every run that completes
+  without raising. healthchecks.io alerts by email on SILENCE (period 5
+  min + grace 15 min), so it catches box death, network death, a disabled
+  timer, or the script crashing every cycle — the failure class the bot's
+  own Telegram alerts CANNOT report, since those need the bot alive. Added
+  after the Aug 3 2026 billing suspension went unnoticed for ~73 min.
+  Deliberately independent of feed health (feeds have their own alerting);
+  tying them together would email "box down" during a mere feed outage.
+  Fail-soft and env-gated: unset (e.g. on GitHub Actions) = no-op.
 - **Scheduling:** systemd timer `ornstein-bot.timer` fires
   `ornstein-bot.service` (oneshot, runs `bot.py` once) **every minute**.
   Unit files: `/etc/systemd/system/ornstein-bot.{service,timer}`.
