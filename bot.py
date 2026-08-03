@@ -34,6 +34,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # Optional: owner's private chat with the bot, for outage alerts (NOT the
 # group). If unset, alerts only appear in the logs.
 TELEGRAM_ALERT_CHAT_ID = os.getenv("TELEGRAM_ALERT_CHAT_ID", "")
+# Optional: healthchecks.io ping URL. Pinged after every completed run so an
+# EXTERNAL service notices if this box/timer/script dies — the one failure
+# class our own Telegram alerts cannot report (they need the bot alive).
+# Treat as a secret. If unset, heartbeats are skipped entirely.
+HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "")
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "David_Ornstein")
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
@@ -312,6 +317,25 @@ def send_telegram(tweet_url: str):
         log.info(f"Posted to Telegram: {embed_url}")
 
 
+def ping_heartbeat():
+    """Phone home to healthchecks.io: "a run just completed". That service
+    alerts the owner on SILENCE (no ping within period+grace), which is what
+    makes it survive this box dying — it needs nothing from us to fire.
+
+    Deliberately NOT tied to feed health: dead feeds are already covered by
+    check_feed_health()/the mirror watchdog, and conflating them would turn
+    a feed outage into a false "box is down" email. This says only: the
+    script ran to completion on a live box.
+
+    Fail-soft: a failed ping is logged and ignored, never affects posting."""
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        requests.get(HEALTHCHECK_URL, timeout=8, headers=USER_AGENT)
+    except Exception as e:
+        log.info(f"Heartbeat ping skipped ({type(e).__name__}).")
+
+
 def send_owner_alert(text: str):
     """DM the owner (never the group). Logs-only if no alert chat configured."""
     if not TELEGRAM_ALERT_CHAT_ID:
@@ -480,3 +504,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Only reached if main() did NOT raise — so repeated crashes stop the
+    # heartbeat and healthchecks.io escalates to email.
+    ping_heartbeat()
