@@ -142,12 +142,26 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
   4. **Stale-feed watchdog** (added Jul 13 2026): the third-party Telegram
      channel `t.me/David_Ornstein` (12k+ subs, mirrors the tweets as TEXT,
      +6 to +49 min lag, no links) is polled via its `t.me/s/` web preview.
-     If its newest post is >45 min newer than the newest tweet our feeds
-     have surfaced (newest = max snowflake ID in `seen`), the owner gets a
-     DM — this catches feeds that are rich-but-STALE, which alerting #3
-     cannot see. It is NEVER a posting source (no tweet links → no fixupx
-     card, no dedup). May rarely false-alarm if the channel posts an ad
-     (rate-limited to 1 DM/day). `MIRROR_CHANNEL=` (empty) disables.
+     If its newest post is >`WATCHDOG_GAP_MINUTES` (45) newer than the
+     newest tweet our feeds have surfaced (newest = max snowflake ID in
+     `seen`), the feeds are considered stale — this catches rich-but-STALE
+     feeds, which alerting #3 cannot see. It is NEVER a posting source (no
+     tweet links → no fixupx card, no dedup). `MIRROR_CHANNEL=` (empty)
+     disables it.
+
+     **Self-heal and alerting are decoupled (rewritten Aug 19 2026 — keep
+     them separate):** detecting staleness forces an instance-pool refresh
+     *immediately, every time* (free, invisible, usually fixes it within a
+     cycle). The owner DM only fires once the gap has PERSISTED for
+     `WATCHDOG_CONFIRM_MINUTES` (45), then at most once per
+     `REALERT_HOURS`. Rationale: feeds lag the mirror transiently all the
+     time and recover on their own, so the original "DM on first sighting"
+     produced near-daily alerts the owner learned to ignore — the exact
+     failure mode that makes a real alert get missed. Two bugs fixed in the
+     same rewrite: (a) the pool refresh used to sit BEHIND the 24h DM
+     cooldown, so during a cooldown staleness was detected and nothing was
+     done; (b) `send_owner_alert()` logged nothing on success, so sent DMs
+     left no journal trace and alert volume could not be audited.
   As of Jul 2026 the richest source is `nitter.net` (~20 tweets). Use
   `python check_feeds.py` (mirrors the bot's dynamic+static list) for live
   status.

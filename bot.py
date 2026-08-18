@@ -87,6 +87,11 @@ FEED_TIMEOUT = 12  # seconds
 # owner. Empty env disables the watchdog.
 MIRROR_CHANNEL = os.getenv("MIRROR_CHANNEL", "David_Ornstein")
 WATCHDOG_GAP_MINUTES = 45  # > the mirror's own worst observed lag
+# A gap must PERSIST this long before the owner is DMed. Feeds lag the
+# mirror transiently all the time and catch up on their own; alerting on a
+# single snapshot produced near-daily noise (Aug 2026). The self-heal still
+# fires immediately — only the notification waits for confirmation.
+WATCHDOG_CONFIRM_MINUTES = 45
 TWITTER_EPOCH_MS = 1288834974657  # snowflake ID → timestamp
 
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"}
@@ -112,6 +117,7 @@ def load_state() -> dict:
     state.setdefault("alert_active", False)
     state.setdefault("last_alert", 0)
     state.setdefault("watchdog_last_alert", 0)
+    state.setdefault("watchdog_stale_since", 0)
     return state
 
 
@@ -347,6 +353,10 @@ def send_owner_alert(text: str):
     )
     if not resp.ok:
         log.error(f"Alert DM failed: {resp.status_code} {resp.text}")
+    else:
+        # Log every DM sent — otherwise alert noise is invisible in the journal
+        # and impossible to audit after the fact.
+        log.info(f"Owner alert DM sent: {text[:90]}")
 
 
 def is_reply_via_api(status_id: str) -> bool:
@@ -376,8 +386,19 @@ def newest_seen_tweet_time(seen: set) -> float | None:
 
 def check_mirror_watchdog(state: dict, seen: set):
     """Compare the mirror channel's newest post time against the newest tweet
-    our feeds have surfaced. A large gap means the feeds are likely serving
-    stale data (or the mirror posted an ad — hence daily rate limit)."""
+    our feeds have surfaced. A gap suggests the feeds are serving stale data
+    (or the mirror posted an ad, or relayed something our sources lag on).
+
+    Two responses, deliberately DECOUPLED — this split is the whole point:
+      * Self-heal (force an instance-pool refresh) fires IMMEDIATELY on every
+        detection. It is free, invisible to the owner, and usually fixes the
+        staleness within a cycle or two.
+      * The owner DM fires only once the gap has PERSISTED for
+        WATCHDOG_CONFIRM_MINUTES, i.e. the self-heal had many chances and
+        failed. Feeds lag the mirror transiently all the time, so alerting on
+        a single snapshot generated near-daily noise the owner learned to
+        ignore (Aug 2026). An alert that fires must mean something is wrong.
+    """
     if not MIRROR_CHANNEL:
         return
     try:
@@ -394,20 +415,42 @@ def check_mirror_watchdog(state: dict, seen: set):
             calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")) for s in stamps
         )
         gap_min = (mirror_newest - ours) / 60
+        now = time.time()
+
         if gap_min <= WATCHDOG_GAP_MINUTES:
+            if state["watchdog_stale_since"]:
+                stale_min = (now - state["watchdog_stale_since"]) / 60
+                log.info(f"Mirror watchdog: feeds caught up after "
+                         f"{stale_min:.0f} min — cleared, no alert needed.")
+            state["watchdog_stale_since"] = 0
             return
-        if time.time() - state["watchdog_last_alert"] < REALERT_HOURS * 3600:
-            return
-        state["watchdog_last_alert"] = time.time()
-        # Self-heal attempt: force a pool refresh next cycle — staleness is
-        # often a pool-snapshot problem (fresh instance excluded, Jul 16 2026).
+
+        # Stale right now. Self-heal on EVERY detection, independent of
+        # whether we are in an alert cooldown (the old code gated the refresh
+        # behind the DM rate limit, so during a 24h cooldown it did nothing).
         state["instances_fetched_at"] = 0
+
+        if not state["watchdog_stale_since"]:
+            state["watchdog_stale_since"] = now
+            log.info(f"Mirror watchdog: gap {gap_min:.0f} min — pool refresh "
+                     f"forced; alerting only if unresolved in "
+                     f"{WATCHDOG_CONFIRM_MINUTES} min.")
+            return
+
+        stale_min = (now - state["watchdog_stale_since"]) / 60
+        if stale_min < WATCHDOG_CONFIRM_MINUTES:
+            log.info(f"Mirror watchdog: gap {gap_min:.0f} min, unresolved for "
+                     f"{stale_min:.0f}/{WATCHDOG_CONFIRM_MINUTES} min.")
+            return
+        if now - state["watchdog_last_alert"] < REALERT_HOURS * 3600:
+            return
+        state["watchdog_last_alert"] = now
         send_owner_alert(
-            f"⚠️ ornstein-bot watchdog: the t.me/{MIRROR_CHANNEL} mirror has a "
-            f"post ~{gap_min:.0f} min newer than the newest tweet our feeds "
-            f"show. Feeds may be serving stale data (or the mirror posted an "
-            f"ad). Instance pool refresh forced. Check "
-            f"https://x.com/{TWITTER_USERNAME} to compare."
+            f"⚠️ ornstein-bot: feeds have been stale for {stale_min:.0f} min "
+            f"and refreshing the instance pool did not fix it (mirror "
+            f"t.me/{MIRROR_CHANNEL} is ~{gap_min:.0f} min ahead). Check "
+            f"https://x.com/{TWITTER_USERNAME} — if he posted something the "
+            f"group never got, the sources need attention."
         )
     except Exception as e:
         log.info(f"Mirror watchdog skipped ({type(e).__name__}).")
