@@ -70,6 +70,9 @@ If you ever need a fallback, `fxtwitter.com` behaves the same way.
 .
 ├── bot.py                          # The whole bot. ~180 lines.
 ├── check_feeds.py                  # Standalone diagnostic: reports which RSS mirrors are alive
+├── .claude/settings.json           # Registers the droplet guardrail hook
+├── .claude/hooks/guard-droplet.sh  # HARD-BLOCKS access-path/power commands (see Hard rules)
+├── .claude/hooks/test-guard.sh     # Tests for the guard — re-run after editing it
 ├── requirements.txt                # feedparser, requests
 ├── .github/workflows/tweet-check.yml  # Cron schedule + run + state cache
 ├── .gitignore                      # Ignores state.json, .env, __pycache__
@@ -195,6 +198,14 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
 - **GitHub Actions cron is unreliable in practice.** Observed: 2 runs in 12
   hours on a `*/5` schedule (Jul 9 2026). This is GitHub's infra, not a config
   bug — and is the main motivation for the VPS migration.
+- **Self-inflicted SSH lockout, Aug 19 2026 (~50 min, bot unaffected).** A
+  discretionary SSH port change — sole benefit: quieter logs — broke the
+  socket-activated SSH unit; the listener came back on neither restart nor
+  reboot. Recovery needed a root password reset and the VNC Recovery Console.
+  The bot posted normally throughout; only access was lost. Full technical
+  detail and the recovery runbook live in `VPS.md` (bearishninja/vps). The
+  behavioural fallout is the "Rules for touching the droplet" in Hard rules
+  below, enforced by `.claude/hooks/guard-droplet.sh`.
 
 ## Production deployment: DigitalOcean droplet (since Jul 10 2026)
 
@@ -295,6 +306,38 @@ everything seen, no spam.
 - If asked to make it faster than every 5 minutes, explain the latency reality
   above rather than silently setting an impossible cron like `* * * * *` (which
   GitHub will just run every 5 min anyway).
+
+### Rules for touching the droplet
+
+Added Aug 19 2026 after a self-inflicted SSH lockout. Read before running
+anything against the box.
+
+- **The access path and power state are FROZEN.** SSH config, the ssh socket/
+  service units, firewall rules, accounts/passwords, authorized_keys, and
+  restarting the machine are all off limits. `.claude/hooks/guard-droplet.sh`
+  blocks them mechanically (registered in `.claude/settings.json`; tests in
+  `.claude/hooks/test-guard.sh`). **If you hit that block, STOP.** Do not look
+  for a workaround, another tool, or a cleverer phrasing. Say what you wanted
+  to run and why, and let the owner decide. Circumventing the guard is a worse
+  failure than the one it exists to prevent.
+- **No discretionary infrastructure changes.** If a change does not fix an
+  observed, reported problem, do not propose it at all. "Cleaner logs",
+  "tidier", "best practice", "while we're in here" are NOT reasons to touch a
+  working box. The Aug 19 lockout came from a change whose entire benefit was
+  quieter log lines.
+- **Casual assent is not authorization.** "sure", "ok", "if it helps", "go
+  ahead" said in passing does not authorize risky infrastructure work —
+  especially from an owner who has said plainly that he is not a developer and
+  does not want to babysit this box. Require an explicit, unprompted request,
+  and state the rollback plan before starting.
+- **Verify the invariant that matters, not the one that is easy.** Before
+  replacing any path the system depends on, prove the EXISTING path still works
+  from a FRESH connection. On Aug 19 the new port was verified while the old
+  listener had already been destroyed — the check passed on an already-broken
+  system.
+- **Prefer doing nothing.** This box runs one thing that matters, it has run it
+  reliably for weeks, and success is measured by the group getting tweets — not
+  by how tidy the server is.
 
 ## Handy commands
 
