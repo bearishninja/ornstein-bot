@@ -2,4 +2,7 @@ state.json
 .env
 __pycache__/
 *.pyc
-.claude/
+# Keep the droplet guardrail (hook + registration) in version control —
+# it must survive a fresh clone. Only the machine-local permissions file is
+# ignored.
+.claude/settings.local.json
