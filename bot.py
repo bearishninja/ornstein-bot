@@ -5,13 +5,17 @@ Designed to run as a single invocation (systemd timer on the droplet, or
 GitHub Actions cron as fallback). Uses RSS feeds — no Twitter API keys needed.
 Persists seen-tweet fingerprints and operational state in a local JSON file.
 
-Resilience model (Jul 2026):
-- Feed instance list is refreshed from the community nitter health tracker
-  (status.d420.de) every few hours, cached in state; static list as fallback.
-- ALL sources are queried in parallel and their valid tweets MERGED (dedup by
-  status ID) — no single feed is a point of failure or freshness bottleneck.
+Resilience model:
+- Feed instance list is refreshed hourly from the community nitter health
+  tracker (status.d420.de), cached in state; static list always appended.
+- ALL sources are queried in parallel, each as RSS *and* as an HTML timeline,
+  and their valid tweets MERGED (dedup by status ID) — no single feed is a
+  point of failure or a freshness bottleneck.
+- Replies are filtered out; only scoops and retweets reach the group.
 - If no source returns a rich feed for ALERT_AFTER_HOURS, the bot DMs the
   owner (TELEGRAM_ALERT_CHAT_ID) — silence must not look like health.
+- Every completed run pings HEALTHCHECK_URL, so an external service notices
+  if this box/timer/script dies.
 """
 
 import os
@@ -79,19 +83,6 @@ REALERT_HOURS = 24
 # the whole run. Fetches run in parallel, so this bounds the whole fetch step.
 FEED_TIMEOUT = 12  # seconds
 
-# Independent watchdog: a third-party Telegram channel that mirrors the tweets
-# as text (no links, and slower than our feeds — measured +6 to +49 min).
-# NEVER used for posting — only to detect the "feeds are rich but STALE"
-# failure mode that source alerting can't see: if the mirror shows activity
-# meaningfully newer than the newest tweet our feeds have surfaced, DM the
-# owner. Empty env disables the watchdog.
-MIRROR_CHANNEL = os.getenv("MIRROR_CHANNEL", "David_Ornstein")
-WATCHDOG_GAP_MINUTES = 45  # > the mirror's own worst observed lag
-# A gap must PERSIST this long before the owner is DMed. Feeds lag the
-# mirror transiently all the time and catch up on their own; alerting on a
-# single snapshot produced near-daily noise (Aug 2026). The self-heal still
-# fires immediately — only the notification waits for confirmation.
-WATCHDOG_CONFIRM_MINUTES = 45
 TWITTER_EPOCH_MS = 1288834974657  # snowflake ID → timestamp
 
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"}
@@ -116,8 +107,6 @@ def load_state() -> dict:
     state.setdefault("last_rich_fetch", 0)
     state.setdefault("alert_active", False)
     state.setdefault("last_alert", 0)
-    state.setdefault("watchdog_last_alert", 0)
-    state.setdefault("watchdog_stale_since", 0)
     return state
 
 
@@ -329,9 +318,9 @@ def ping_heartbeat():
     makes it survive this box dying — it needs nothing from us to fire.
 
     Deliberately NOT tied to feed health: dead feeds are already covered by
-    check_feed_health()/the mirror watchdog, and conflating them would turn
-    a feed outage into a false "box is down" email. This says only: the
-    script ran to completion on a live box.
+    check_feed_health(), and conflating them would turn a feed outage into a
+    false "box is down" email. This says only: the script ran to completion
+    on a live box.
 
     Fail-soft: a failed ping is logged and ignored, never affects posting."""
     if not HEALTHCHECK_URL:
@@ -372,88 +361,6 @@ def is_reply_via_api(status_id: str) -> bool:
         return bool(resp.json().get("tweet", {}).get("replying_to"))
     except Exception:
         return False
-
-
-def newest_seen_tweet_time(seen: set) -> float | None:
-    """Unix time of the newest tweet we've seen, derived from the largest
-    numeric fingerprint (status IDs are snowflakes: time-ordered, and they
-    embed their creation timestamp)."""
-    ids = [int(fp) for fp in seen if fp.isdigit()]
-    if not ids:
-        return None
-    return ((max(ids) >> 22) + TWITTER_EPOCH_MS) / 1000
-
-
-def check_mirror_watchdog(state: dict, seen: set):
-    """Compare the mirror channel's newest post time against the newest tweet
-    our feeds have surfaced. A gap suggests the feeds are serving stale data
-    (or the mirror posted an ad, or relayed something our sources lag on).
-
-    Two responses, deliberately DECOUPLED — this split is the whole point:
-      * Self-heal (force an instance-pool refresh) fires IMMEDIATELY on every
-        detection. It is free, invisible to the owner, and usually fixes the
-        staleness within a cycle or two.
-      * The owner DM fires only once the gap has PERSISTED for
-        WATCHDOG_CONFIRM_MINUTES, i.e. the self-heal had many chances and
-        failed. Feeds lag the mirror transiently all the time, so alerting on
-        a single snapshot generated near-daily noise the owner learned to
-        ignore (Aug 2026). An alert that fires must mean something is wrong.
-    """
-    if not MIRROR_CHANNEL:
-        return
-    try:
-        resp = requests.get(f"https://t.me/s/{MIRROR_CHANNEL}",
-                            timeout=10, headers=BROWSER_UA)
-        if not resp.ok:
-            log.info(f"Mirror watchdog: t.me/s/{MIRROR_CHANNEL} → HTTP {resp.status_code}")
-            return
-        stamps = re.findall(r'datetime="(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', resp.text)
-        ours = newest_seen_tweet_time(seen)
-        if not stamps or ours is None:
-            return
-        mirror_newest = max(
-            calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")) for s in stamps
-        )
-        gap_min = (mirror_newest - ours) / 60
-        now = time.time()
-
-        if gap_min <= WATCHDOG_GAP_MINUTES:
-            if state["watchdog_stale_since"]:
-                stale_min = (now - state["watchdog_stale_since"]) / 60
-                log.info(f"Mirror watchdog: feeds caught up after "
-                         f"{stale_min:.0f} min — cleared, no alert needed.")
-            state["watchdog_stale_since"] = 0
-            return
-
-        # Stale right now. Self-heal on EVERY detection, independent of
-        # whether we are in an alert cooldown (the old code gated the refresh
-        # behind the DM rate limit, so during a 24h cooldown it did nothing).
-        state["instances_fetched_at"] = 0
-
-        if not state["watchdog_stale_since"]:
-            state["watchdog_stale_since"] = now
-            log.info(f"Mirror watchdog: gap {gap_min:.0f} min — pool refresh "
-                     f"forced; alerting only if unresolved in "
-                     f"{WATCHDOG_CONFIRM_MINUTES} min.")
-            return
-
-        stale_min = (now - state["watchdog_stale_since"]) / 60
-        if stale_min < WATCHDOG_CONFIRM_MINUTES:
-            log.info(f"Mirror watchdog: gap {gap_min:.0f} min, unresolved for "
-                     f"{stale_min:.0f}/{WATCHDOG_CONFIRM_MINUTES} min.")
-            return
-        if now - state["watchdog_last_alert"] < REALERT_HOURS * 3600:
-            return
-        state["watchdog_last_alert"] = now
-        send_owner_alert(
-            f"⚠️ ornstein-bot: feeds have been stale for {stale_min:.0f} min "
-            f"and refreshing the instance pool did not fix it (mirror "
-            f"t.me/{MIRROR_CHANNEL} is ~{gap_min:.0f} min ahead). Check "
-            f"https://x.com/{TWITTER_USERNAME} — if he posted something the "
-            f"group never got, the sources need attention."
-        )
-    except Exception as e:
-        log.info(f"Mirror watchdog skipped ({type(e).__name__}).")
 
 
 def check_feed_health(state: dict, any_rich: bool):
@@ -497,8 +404,6 @@ def main():
 
     if not merged:
         log.warning("Nothing to process. Exiting.")
-        if seen:
-            check_mirror_watchdog(state, seen)
         save_state(state, seen)
         return
 
@@ -540,7 +445,6 @@ def main():
         if skipped_replies:
             log.info(f"Skipped {skipped_replies} reply(ies) — marked seen, not posted.")
         log.info(f"Done — forwarded {sent} new tweet(s).")
-        check_mirror_watchdog(state, seen)
 
     save_state(state, seen)
 

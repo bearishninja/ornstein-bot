@@ -125,11 +125,10 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
      healthy + not bad-host instances — the rss flag is NOT required, see
      #2, and there is NO top-N cutoff) every 1h, cached in state.json.
      Static fallbacks (nitter.net, xcancel, rsshub, diffbot) are always
-     appended, so a dead/poisoned tracker can't blind the bot. A watchdog
-     alert (#4) also forces an immediate pool refresh. (Jul 16 2026
+     appended, so a dead/poisoned tracker can't blind the bot. (Jul 16 2026
      incident: a 6h-old top-6 snapshot excluded kareem.one — the only
-     fresh instance — while every pooled source was stale; caught by the
-     watchdog in ~5 min, tweet salvaged manually ~10 min late.)
+     fresh instance — while every pooled source was stale; hence hourly
+     refresh and no cutoff.)
   2. **Dual-mode source merging:** every instance is fetched BOTH as RSS and
      as an HTML timeline (`tweet-link` anchors only — `quote-link` anchors
      are embedded quoted tweets and are excluded; timestamps derived from
@@ -142,29 +141,20 @@ Only pursue it if the owner explicitly decides speed is worth the rewrite.
      for >2h, the bot DMs the owner via `TELEGRAM_ALERT_CHAT_ID` (re-alerts
      at most daily; sends a recovery DM when sources return). If that env is
      unset, alerts are log-only. The DM goes to the owner, NEVER the group.
-  4. **Stale-feed watchdog** (added Jul 13 2026): the third-party Telegram
-     channel `t.me/David_Ornstein` (12k+ subs, mirrors the tweets as TEXT,
-     +6 to +49 min lag, no links) is polled via its `t.me/s/` web preview.
-     If its newest post is >`WATCHDOG_GAP_MINUTES` (45) newer than the
-     newest tweet our feeds have surfaced (newest = max snowflake ID in
-     `seen`), the feeds are considered stale — this catches rich-but-STALE
-     feeds, which alerting #3 cannot see. It is NEVER a posting source (no
-     tweet links → no fixupx card, no dedup). `MIRROR_CHANNEL=` (empty)
-     disables it.
+  4. **Stale-feed watchdog — REMOVED Aug 20 2026. Do not rebuild it.** A
+     third-party Telegram mirror channel (`t.me/David_Ornstein`) was polled to
+     catch feeds that were rich-but-STALE, by comparing its newest post time
+     against the newest tweet our feeds had surfaced. It caught two real
+     incidents (Jul 15 and Jul 16 2026) — both of which are now handled
+     automatically by dual-mode fetching (#2), hourly pool refresh (#1), and
+     the pool-refresh self-heal. After that it produced only false alarms,
+     because the channel posts **paid advertisements**: an ad is permanently
+     "newer" than our latest tweet, so it defeated both the 45-minute
+     persistence check and the daily rate limit and paged the owner about a
+     music promo. The owner (correctly) retired it. Lesson worth keeping: an
+     alert that cannot be acted on is worse than no alert, because it trains
+     the owner to ignore the alerts that matter.
 
-     **Self-heal and alerting are decoupled (rewritten Aug 19 2026 — keep
-     them separate):** detecting staleness forces an instance-pool refresh
-     *immediately, every time* (free, invisible, usually fixes it within a
-     cycle). The owner DM only fires once the gap has PERSISTED for
-     `WATCHDOG_CONFIRM_MINUTES` (45), then at most once per
-     `REALERT_HOURS`. Rationale: feeds lag the mirror transiently all the
-     time and recover on their own, so the original "DM on first sighting"
-     produced near-daily alerts the owner learned to ignore — the exact
-     failure mode that makes a real alert get missed. Two bugs fixed in the
-     same rewrite: (a) the pool refresh used to sit BEHIND the 24h DM
-     cooldown, so during a cooldown staleness was detected and nothing was
-     done; (b) `send_owner_alert()` logged nothing on success, so sent DMs
-     left no journal trace and alert volume could not be audited.
   As of Jul 2026 the richest source is `nitter.net` (~20 tweets). Use
   `python check_feeds.py` (mirrors the bot's dynamic+static list) for live
   status.
