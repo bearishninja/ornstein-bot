@@ -33,8 +33,11 @@ import requests
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# Read with getenv (not os.environ[...]) so this module can be imported by
+# check_feeds.py without secrets present. main() validates them and exits
+# with a clear message if they are missing.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Optional: owner's private chat with the bot, for outage alerts (NOT the
 # group). If unset, alerts only appear in the logs.
 TELEGRAM_ALERT_CHAT_ID = os.getenv("TELEGRAM_ALERT_CHAT_ID", "")
@@ -57,15 +60,23 @@ INSTANCE_REFRESH_HOURS = 1
 # (rss+html) is polite, and the excluded instance is always the one you need.
 
 # Static fallbacks, used alongside whatever the tracker provides.
+# Dropped Aug 20 2026 after measuring 60 consecutive cycles: rsshub.app
+# (permanent 404) and rss.diffbot.com (junk/timeouts, never once a valid
+# tweet — and the source that put 3 junk links in the group on Jul 13) never
+# contributed anything. Do not re-add without evidence they work.
 STATIC_FEEDS = [
     f"https://nitter.net/{TWITTER_USERNAME}/rss",
     f"https://xcancel.com/{TWITTER_USERNAME}/rss",
     f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
-    # RSSHub mirrors — mostly dead as of Jul 2026, kept as cheap extra chances
-    f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
-    # Thin scraper fallback; its junk entries are filtered by is_tweet_entry()
-    f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
 ]
+
+# Two-tier probing (Aug 20 2026). Measured: 20 probes/cycle, only 2 ever
+# yielded tweets — ~26k useless requests/day, mostly to volunteer instances
+# that 403 this droplet's datacenter IP. Normal cycles now probe only sources
+# proven to work; the full list is swept this often to rediscover changes.
+# Discovery still matters (kareem.one was the only fresh source on Jul 16),
+# it just does not need to happen every single minute.
+SWEEP_MINUTES = 30
 
 # Never post tweets older than this. Protects against a burst of stale posts
 # when a rich feed comes back after an outage or when the source switches
@@ -107,6 +118,11 @@ def load_state() -> dict:
     state.setdefault("last_rich_fetch", 0)
     state.setdefault("alert_active", False)
     state.setdefault("last_alert", 0)
+    state.setdefault("proven", [])       # "kind|url" of sources that yielded
+    state.setdefault("last_sweep", 0)
+    # Inert leftovers from the retired mirror watchdog — drop on next write.
+    state.pop("watchdog_last_alert", None)
+    state.pop("watchdog_stale_since", None)
     return state
 
 
@@ -171,9 +187,14 @@ def refresh_instances(state: dict):
             if h.get("healthy") and not h.get("is_bad_host")
         ]
         if good:
+            changed = good != state["instances"]
             state["instances"] = good
             state["instances_fetched_at"] = time.time()
-            log.info(f"Instance pool refreshed from tracker: {state['instances']}")
+            if changed:
+                # New/removed instances must be probed before they can become
+                # "proven", so force a full sweep on this cycle.
+                state["last_sweep"] = 0
+                log.info(f"Instance pool refreshed from tracker: {good}")
         else:
             log.warning("Tracker returned no healthy RSS instances; keeping cache.")
     except Exception as e:
@@ -194,6 +215,26 @@ def build_sources(state: dict) -> list:
         if ("rss", u) not in sources:
             sources.append(("rss", u))
     return sources
+
+
+def source_key(source: tuple) -> str:
+    return f"{source[0]}|{source[1]}"
+
+
+def select_sources(state: dict, all_sources: list) -> tuple[list, bool]:
+    """Two-tier probing: normally probe only sources that produced tweets on
+    the last sweep, which is ~2-4 requests instead of ~20. Sweep the full list
+    every SWEEP_MINUTES (and whenever `proven` is empty or the instance pool
+    changed) so a newly-working source gets discovered.
+
+    Returns (sources_to_probe, is_full_sweep)."""
+    due = (time.time() - state["last_sweep"]) > SWEEP_MINUTES * 60
+    if not state["proven"] or due:
+        return all_sources, True
+    proven = [s for s in all_sources if source_key(s) in state["proven"]]
+    if not proven:               # pool rotated away from everything proven
+        return all_sources, True
+    return proven, False
 
 
 # ── RSS fetching ────────────────────────────────────────────────────────────
@@ -255,18 +296,28 @@ def fetch_one(source: tuple):
         return f"failed ({type(e).__name__}), skipping", []
 
 
-def fetch_all_feeds(sources: list) -> tuple[dict, bool]:
-    """Query every source in parallel and MERGE their valid tweets, deduped
+def fetch_all_feeds(sources: list, verbose: bool = True) -> tuple[dict, bool, list]:
+    """Query the given sources in parallel and MERGE their valid tweets, deduped
     by fingerprint. Merging (vs picking one winner) means a single stale or
     blipping source can't hide a tweet another source already has.
 
-    Returns (fingerprint -> entry map, whether any source was rich)."""
+    `verbose` controls per-source logging: full detail on sweeps, but on a
+    normal cycle only sources that STOPPED yielding are worth a line. Logging
+    every source every minute produced ~43k journal lines/day and capped
+    history at ~6 days.
+
+    Returns (fingerprint -> entry map, any source was rich, productive keys)."""
     merged: dict = {}
     any_rich = False
+    productive: list = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(fetch_one, sources))
-    for (kind, url), (status_line, tweets) in zip(sources, results):
-        log.info(f"  [{kind}] {url} → {status_line}")
+    for source, (status_line, tweets) in zip(sources, results):
+        kind, url = source
+        if verbose or not tweets:
+            log.info(f"  [{kind}] {url} → {status_line}")
+        if tweets:
+            productive.append(source_key(source))
         if len(tweets) >= RICH_FEED_MIN_TWEETS:
             any_rich = True
         for entry in tweets:
@@ -278,9 +329,9 @@ def fetch_all_feeds(sources: list) -> tuple[dict, bool]:
                     merged[fp]["is_reply"] = True
             else:
                 merged[fp] = entry
-    log.info(f"Merged {len(merged)} unique tweets "
-             f"from {sum(1 for _, t in results if t)} live source(s).")
-    return merged, any_rich
+    log.info(f"Merged {len(merged)} unique tweets from {len(productive)}/"
+             f"{len(sources)} source(s){' [full sweep]' if verbose else ''}.")
+    return merged, any_rich, productive
 
 
 # ── Telegram ────────────────────────────────────────────────────────────────
@@ -392,6 +443,10 @@ def check_feed_health(state: dict, any_rich: bool):
 # ── Single run ─────────────────────────────────────────────────────────────
 
 def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set "
+                         "(see /opt/ornstein-bot/.env on the droplet).")
+
     log.info(f"Checking @{TWITTER_USERNAME} for new tweets…")
 
     state = load_state()
@@ -399,7 +454,21 @@ def main():
     first_run = len(seen) == 0
 
     refresh_instances(state)
-    merged, any_rich = fetch_all_feeds(build_sources(state))
+    all_sources = build_sources(state)
+    to_probe, sweep = select_sources(state, all_sources)
+    merged, any_rich, productive = fetch_all_feeds(to_probe, verbose=sweep)
+
+    # Self-heal: a proven-only cycle that found nothing means a workhorse just
+    # died. Sweep everything NOW rather than waiting up to SWEEP_MINUTES.
+    if not merged and not sweep:
+        log.info("Proven sources yielded nothing — sweeping all sources now.")
+        merged, any_rich, productive = fetch_all_feeds(all_sources, verbose=True)
+        sweep = True
+
+    if sweep:
+        state["proven"] = productive
+        state["last_sweep"] = time.time()
+
     check_feed_health(state, any_rich)
 
     if not merged:

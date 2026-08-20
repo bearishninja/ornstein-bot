@@ -1,106 +1,77 @@
 """
-Standalone diagnostic: checks every RSS feed source bot.py can use and
-reports how many entries each one returns right now.
+Standalone diagnostic: probes every source bot.py can use and reports which
+are alive, how many tweets each returns, and which is freshest.
 
-Run anytime you want to see which mirrors are alive:
     python check_feeds.py
 
-Mirrors bot.py's source list: the dynamic instance pool cached in state.json
-(if present) plus the static fallbacks. Does not touch state, does not post
-to Telegram, needs no env vars or secrets.
+Imports the source list and fetchers from bot.py so there is ONE definition of
+where tweets come from (this file used to keep its own copy, which drifted).
+Touches no state, posts nothing, needs no secrets.
 """
 
-import os
-import re
 import json
+import re
 from pathlib import Path
 
-import feedparser
-import requests
+from bot import (
+    STATE_FILE,
+    TWITTER_USERNAME,
+    build_sources,
+    fetch_one,
+    fingerprint,
+    source_key,
+)
 
-TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "David_Ornstein")
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-FEED_TIMEOUT = 12  # seconds
-
-STATIC_FEEDS = [
-    f"https://nitter.net/{TWITTER_USERNAME}/rss",
-    f"https://xcancel.com/{TWITTER_USERNAME}/rss",
-    f"https://nitter.privacyredirect.com/{TWITTER_USERNAME}/rss",
-    f"https://rsshub.app/twitter/user/{TWITTER_USERNAME}",
-    f"https://rss.diffbot.com/rss?url=https://x.com/{TWITTER_USERNAME}",
-]
+TWITTER_EPOCH_MS = 1288834974657
 
 
-def feed_sources() -> list:
-    """(kind, url) pairs mirroring bot.py: each instance tried as RSS and as
-    an HTML timeline."""
-    sources = []
+def load_pool() -> dict:
+    """Minimal state stand-in: the cached instance pool and proven set, so this
+    reports on exactly the sources the bot would use."""
     path = Path(STATE_FILE)
+    state = {"instances": [], "proven": []}
     if path.exists():
         try:
-            instances = json.loads(path.read_text()).get("instances", [])
-            for inst in instances:
-                sources.append(("rss", f"{inst}/{TWITTER_USERNAME}/rss"))
-                sources.append(("html", f"{inst}/{TWITTER_USERNAME}"))
-            if sources:
-                print(f"(including {len(instances)} tracker-discovered "
-                      f"instances from {STATE_FILE})\n")
+            saved = json.loads(path.read_text())
+            state["instances"] = saved.get("instances", [])
+            state["proven"] = saved.get("proven", [])
         except Exception:
             pass
-    for u in STATIC_FEEDS:
-        if ("rss", u) not in sources:
-            sources.append(("rss", u))
-    return sources
+    return state
 
 
-BROWSER_UA = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                             "AppleWebKit/537.36 Chrome/126.0 Safari/537.36")}
-BOT_UA = {"User-Agent": "Mozilla/5.0 (compatible; OrnsteinBot/1.0)"}
-
-
-def newest_id(ids):
-    return max((int(i) for i in ids), default=None)
+def tweet_time(sid: str) -> str:
+    import datetime
+    ts = ((int(sid) >> 22) + TWITTER_EPOCH_MS) / 1000
+    return datetime.datetime.fromtimestamp(
+        ts, datetime.timezone.utc).strftime("%b %d %H:%M UTC")
 
 
 def main():
-    print(f"Checking feeds for @{TWITTER_USERNAME}...\n")
-    freshest = (None, None)  # (status_id, source)
+    state = load_pool()
+    sources = build_sources(state)
+    print(f"Checking {len(sources)} sources for @{TWITTER_USERNAME}"
+          f" ({len(state['instances'])} from the cached tracker pool)\n")
 
-    for kind, url in feed_sources():
-        try:
-            headers = BROWSER_UA if kind == "html" else BOT_UA
-            resp = requests.get(url, timeout=FEED_TIMEOUT, headers=headers)
-            if not resp.ok:
-                print(f"  DOWN      HTTP {resp.status_code}          [{kind}] {url}")
-                continue
-            if kind == "html":
-                ids = [s for _, s in re.findall(
-                    r'class="tweet-link" href="/([A-Za-z0-9_]+)/status/(\d+)',
-                    resp.text)]
-                note = ""
-            else:
-                entries = feedparser.parse(resp.content).entries
-                valid = [e for e in entries
-                         if re.search(r"/status/\d+", e.get("link", "") or "")]
-                ids = [m.group(1) for e in valid
-                       if (m := re.search(r"/status/(\d+)", e.get("link", "")))]
-                note = "" if len(valid) == len(entries) else \
-                    f"  ({len(entries) - len(valid)} junk discarded)"
-            label = "OK" if ids else "EMPTY"
-            print(f"  {label:<9} {len(ids):3d} tweets        [{kind}] {url}{note}")
-            top = newest_id(ids)
-            if top and (freshest[0] is None or top > freshest[0]):
-                freshest = (top, f"[{kind}] {url}")
-        except Exception as e:
-            print(f"  FAIL      {type(e).__name__:<20} [{kind}] {url}")
+    freshest = (None, None)
+    for source in sources:
+        kind, url = source
+        status, tweets = fetch_one(source)
+        star = " *proven*" if source_key(source) in state["proven"] else ""
+        label = "OK   " if tweets else "     "
+        print(f"  {label} [{kind:4}] {url}\n         → {status}{star}")
+        for e in tweets:
+            fp = fingerprint(e)
+            if fp.isdigit() and (freshest[0] is None or int(fp) > int(freshest[0])):
+                freshest = (fp, f"[{kind}] {url}")
 
     print()
     if freshest[0]:
-        print(f"Freshest source right now: {freshest[1]}")
-        print(f"  newest status id: {freshest[0]}")
-        print("(bot.py merges ALL live sources, so freshness wins overall)")
+        print(f"Freshest tweet seen: {tweet_time(freshest[0])} "
+              f"(id {freshest[0]})\n  via {freshest[1]}")
+        print("bot.py merges ALL responding sources, so freshness wins overall.")
     else:
-        print("No source is returning tweets — the bot is blind right now.")
+        print("No source returned a tweet — the bot is blind right now.")
 
 
 if __name__ == "__main__":

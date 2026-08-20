@@ -32,26 +32,46 @@ quote-reply *without leaving Telegram or clicking through to X*.
 ## How it works (architecture)
 
 ```
-GitHub Actions cron (every 5 min)
+systemd timer on the droplet (every minute)
         │
         ▼
-   bot.py runs once
+   bot.py runs once, exits
         │
-        ├─ 1. Load "seen tweet" fingerprints from state.json (restored from Actions cache)
-        ├─ 2. Query ALL RSS feed sources; keep the response with the MOST entries
-        ├─ 3. For each entry not already seen (oldest-first):
-        │        rewrite x.com URL → fixupx.com URL
-        │        POST it to Telegram sendMessage
-        ├─ 4. Save updated fingerprints back to state.json (saved to Actions cache)
+        ├─ 1. Load state.json (seen tweet IDs, instance pool, proven sources)
+        ├─ 2. Refresh the nitter instance pool from the health tracker (hourly)
+        ├─ 3. Probe sources — normally just the PROVEN ones (~2-4 requests);
+        │      full sweep of all ~20 every 30 min, or at once if a cycle
+        │      yields nothing (see "Two-tier probing" below)
+        ├─ 4. Merge every source's valid tweets, dedup by numeric status ID
+        ├─ 5. Drop replies and anything older than MAX_TWEET_AGE_HOURS
+        ├─ 6. Post the rest oldest-first as fixupx.com links
+        ├─ 7. Save state, ping healthchecks.io
         └─ done (process exits)
 ```
 
-- **No Twitter/X API keys.** We read public RSS feeds instead. This avoids X's
-  paid API entirely.
-- **No server.** It runs as a scheduled GitHub Actions workflow. Public repo =
-  unlimited free Actions minutes.
-- **State** (which tweets we've already posted) is a small `state.json` file,
-  persisted between runs via the Actions cache (NOT committed to the repo).
+- **No Twitter/X API keys.** Public RSS feeds and scraped nitter HTML only.
+- **Runs on the owner's DigitalOcean droplet** via a systemd timer, not on
+  GitHub Actions (that was the original design; the workflow is now a disabled
+  fallback — see Deployment). State is a local `state.json`, gitignored.
+- **~1-3 min latency** end to end, bounded by the upstream feeds' own refresh
+  rate rather than by our polling.
+
+### Two-tier probing (added Aug 20 2026 — keep this)
+
+Measured over 60 consecutive cycles: 20 source probes per cycle, of which
+exactly **2** ever returned tweets (`[rss] nitter.net`, `[html] xcancel.com`).
+The other 18 failed identically every minute — six nitter instances return
+**403 to this droplet's datacenter IP** even though the tracker reports them
+healthy (they are, from a browser). That was ~26,000 useless requests/day
+aimed at volunteer-run instances, and ~43,000 journal lines/day, which capped
+log history at ~6 days.
+
+So: normal cycles probe only `state["proven"]`; the full list is swept every
+`SWEEP_MINUTES` (30) to rediscover, immediately if the pool changed, and
+**immediately if a proven-only cycle yields nothing** — that last path is what
+stops a dying workhorse from blinding the bot. Do not "simplify" this back to
+probing everything every minute, and do not delete discovery either: on Jul 16
+a tracker-discovered instance was the only source with a fresh tweet.
 
 ## The fixupx.com trick (do not remove)
 
@@ -68,8 +88,8 @@ If you ever need a fallback, `fxtwitter.com` behaves the same way.
 
 ```
 .
-├── bot.py                          # The whole bot. ~180 lines.
-├── check_feeds.py                  # Standalone diagnostic: reports which RSS mirrors are alive
+├── bot.py                          # The whole bot (~525 lines).
+├── check_feeds.py                  # Diagnostic: probes every source (imports bot.py — one source list)
 ├── .claude/settings.json           # Registers the droplet guardrail hook
 ├── .claude/hooks/guard-droplet.sh  # HARD-BLOCKS access-path/power commands (see Hard rules)
 ├── .claude/hooks/test-guard.sh     # Tests for the guard — re-run after editing it
@@ -82,125 +102,113 @@ If you ever need a fallback, `fxtwitter.com` behaves the same way.
 
 ## Deployment
 
-- **Repo:** `bearishninja/ornstein-bot` (GitHub, public).
-- **Trigger:** `.github/workflows/tweet-check.yml` runs on a `*/5 * * * *` cron
-  and on manual `workflow_dispatch` (Actions tab → Run workflow).
-- **Secrets** (repo Settings → Secrets and variables → Actions):
-  - `TELEGRAM_BOT_TOKEN` — the BotFather token.
-  - `TELEGRAM_CHAT_ID` — the group chat ID (a negative number, e.g. `-1001510845978`).
-- **Optional variable:** `TWITTER_USERNAME` (defaults to `David_Ornstein`).
+**Production: the owner's DigitalOcean droplet** (full detail, runbook and
+box-wide conventions in the "Production deployment" section below and in the
+`bearishninja/vps` repo).
+
+- **Repo:** `bearishninja/ornstein-bot` (GitHub, public — note it documents the
+  droplet's IP and layout; no secrets, but see "Note" at the end).
+- **Trigger:** `ornstein-bot.timer` fires `ornstein-bot.service` every minute.
+- **Secrets:** `/opt/ornstein-bot/.env` on the droplet (chmod 600).
+- **Fallback:** the GitHub Actions workflow is kept but **disabled** so the two
+  can't double-post. Re-enable from the Actions tab if the droplet dies.
 
 ### The Telegram side (already set up, for reference)
-- Bot created via @BotFather.
-- Bot username: `ornstein_alerts_bot`.
+- Bot created via @BotFather; username `ornstein_alerts_bot`.
 - Target group chat ID: `-1001510845978` (group "BMS FC").
-- Bot must be a member of the group with permission to post.
+- Owner's private chat with the bot receives outage DMs
+  (`TELEGRAM_ALERT_CHAT_ID`).
+- Bot must remain a member of the group with permission to post.
 
-## Latency reality (important context, don't re-litigate)
+## Latency reality (don't re-litigate)
 
-The owner asked for ~1-minute delivery. This is **not achievable for free on
-GitHub Actions**, for two independent reasons — both already researched:
+Delivery is ~1-3 min after Ornstein tweets, and the remaining delay is **the
+upstream feeds' own refresh rate**, not our scheduler — the timer already runs
+every minute. Polling faster buys nothing.
 
-1. **GitHub Actions cron floor is 5 minutes** and scheduled runs are frequently
-   delayed 5–30 min under load (no SLA). `*/5` is the fastest valid schedule.
-2. **The free RSS feed's own refresh rate is the real bottleneck.** Polling
-   faster than the upstream feed updates buys nothing.
+Historical note: on GitHub Actions this was far worse (cron floor of 5 min, and
+observed gaps of 3-5 HOURS), which is why the bot moved to the droplet. If
+someone asks for faster delivery, the honest answer is that it needs a better
+data source (a logged-in X session or the paid API), not a faster loop.
 
-True ~1-minute delivery would require moving off GitHub Actions to **Cloudflare
-Workers** (free tier, 1-minute cron, always-on, KV for state) — but that means a
-JavaScript rewrite. This is a documented, deliberate future option, NOT a bug.
-Only pursue it if the owner explicitly decides speed is worth the rewrite.
+## Safeguards (keep these — each one exists because of a real incident)
 
-## Known issues / current state
+Feed fragility is the #1 ongoing risk. Everything below is load-bearing; the
+*reason* is recorded with each rule because that reason is what should stop a
+future session "simplifying" it away.
 
-- **A tweet was missed on Jul 9 2026** (posted ~6.5h late after a fix): GitHub's
-  cron ran only twice in 12 hours AND all feed sources were dead simultaneously.
-  This prompted two changes: (a) the feed list was refreshed around nitter.net
-  (see below), and (b) the owner decided to migrate the bot to a personal
-  DigitalOcean VPS — see "Planned migration" below.
-- **Feed fragility is the #1 ongoing risk — now mitigated three ways**
-  (added Jul 13 2026):
-  1. **Dynamic discovery:** the bot refreshes its nitter instance pool from
-     the community health tracker (`status.d420.de/api/v1/instances`, ALL
-     healthy + not bad-host instances — the rss flag is NOT required, see
-     #2, and there is NO top-N cutoff) every 1h, cached in state.json.
-     Static fallbacks (nitter.net, xcancel, rsshub, diffbot) are always
-     appended, so a dead/poisoned tracker can't blind the bot. (Jul 16 2026
-     incident: a 6h-old top-6 snapshot excluded kareem.one — the only
-     fresh instance — while every pooled source was stale; hence hourly
-     refresh and no cutoff.)
-  2. **Dual-mode source merging:** every instance is fetched BOTH as RSS and
-     as an HTML timeline (`tweet-link` anchors only — `quote-link` anchors
-     are embedded quoted tweets and are excluded; timestamps derived from
-     snowflake IDs). All responding sources are fetched in parallel and
-     their valid tweets merged (dedup by status ID) — no winner-takes-all.
-     Added after the Jul 15 2026 incident: nitter.net's RSS went
-     rich-but-STALE for 27h+ (a fresh EXCL was posted manually, ~7 min
-     late), while rss-less nitter.kareem.one had it fresh in HTML.
-  3. **Owner alerting:** if no source returns a rich feed (≥5 valid tweets)
-     for >2h, the bot DMs the owner via `TELEGRAM_ALERT_CHAT_ID` (re-alerts
-     at most daily; sends a recovery DM when sources return). If that env is
-     unset, alerts are log-only. The DM goes to the owner, NEVER the group.
-  4. **Stale-feed watchdog — REMOVED Aug 20 2026. Do not rebuild it.** A
-     third-party Telegram mirror channel (`t.me/David_Ornstein`) was polled to
-     catch feeds that were rich-but-STALE, by comparing its newest post time
-     against the newest tweet our feeds had surfaced. It caught two real
-     incidents (Jul 15 and Jul 16 2026) — both of which are now handled
-     automatically by dual-mode fetching (#2), hourly pool refresh (#1), and
-     the pool-refresh self-heal. After that it produced only false alarms,
-     because the channel posts **paid advertisements**: an ad is permanently
-     "newer" than our latest tweet, so it defeated both the 45-minute
-     persistence check and the daily rate limit and paged the owner about a
-     music promo. The owner (correctly) retired it. Lesson worth keeping: an
-     alert that cannot be acted on is worse than no alert, because it trains
-     the owner to ignore the alerts that matter.
+- **`is_tweet_entry()`** — only entries whose link contains `/status/<id>` are
+  eligible, for posting *and* for source selection. Without it a scraper's
+  login-page furniture (help/signup/t.co links) reaches the group.
+- **Fingerprint = numeric status ID**, extracted from any source's link format,
+  so the same tweet dedupes identically no matter which mirror served it.
+  Switching sources must never re-post.
+- **`send_telegram()` canonicalises every link** to
+  `fixupx.com/<user>/status/<id>`. Never post a raw mirror URL — only the
+  fixupx form renders the card, which is the entire point of the bot (goal #1).
+- **`MAX_TWEET_AGE_HOURS = 24`** — older entries are marked seen but never
+  posted, so a feed returning after an outage can't flood the group with stale
+  news. Deliberate tradeoff: if every source is dead >24h, that window is lost.
+- **Dual-mode fetching** — every instance is tried as RSS *and* as an HTML
+  timeline, because an instance can serve one and not the other, and RSS can go
+  rich-but-STALE while HTML is fresh. HTML parsing uses `tweet-link` anchors
+  only; `quote-link` anchors are embedded quoted tweets and must stay excluded.
+- **Merge, never winner-takes-all** — all responding sources are merged by
+  status ID, so one stale source cannot hide a tweet another source has.
+- **Dynamic instance discovery** — the pool refreshes hourly from
+  `status.d420.de/api/v1/instances` (all healthy, not-bad-host instances; the
+  `rss` flag is deliberately *not* required, since we also scrape HTML). Static
+  entries are always appended so a dead or poisoned tracker can't blind the bot.
+- **Two-tier probing** — see the architecture section. Normal cycles probe only
+  proven sources; sweeps rediscover. Both halves matter.
+- **Reply filtering** — the group wants scoops and retweets, not reply-thread
+  chatter. Three layers, because no single source sees every reply: nitter RSS
+  titles replies `"R to @user:"` (catches replies to others *and* self-replies);
+  nitter HTML marks replies to others with `replying-to` (but not self-replies);
+  and `is_reply_via_api()` confirms against `api.fxtwitter.com` immediately
+  before posting. That last check **fails OPEN** — if the API is down we post
+  anyway, because a missed scoop is worse than a stray reply. Reply flags
+  survive the merge, so an unflagged duplicate can't launder a flagged one.
+  Deliberate tradeoff: substantive self-thread continuations are skipped too.
+- **Dead-feed alert** — if no source returns a rich feed (≥`RICH_FEED_MIN_TWEETS`)
+  for `ALERT_AFTER_HOURS`, the bot DMs the owner (`TELEGRAM_ALERT_CHAT_ID`),
+  re-alerting at most once per `REALERT_HOURS`, with a recovery DM when sources
+  return. Never posts alerts to the group.
+- **External heartbeat** — every completed run pings `HEALTHCHECK_URL`
+  (healthchecks.io), which alerts by email on *silence*. This is the only
+  monitoring that survives the box dying, since every other alarm runs on it.
+  Deliberately independent of feed health: tying them together would email
+  "box down" during an ordinary feed outage.
 
-  As of Jul 2026 the richest source is `nitter.net` (~20 tweets). Use
-  `python check_feeds.py` (mirrors the bot's dynamic+static list) for live
-  status.
-- **Safeguards against re-post/spam** (added Jul 2026, keep these):
-  - `is_tweet_entry()`: only entries whose link contains `/status/<id>` are
-    eligible — for posting AND for the most-entries feed contest. Added after
-    a Jul 13 2026 incident: nitter blipped for one cycle, diffbot won with 4
-    "entries" that were actually X login-page furniture (help/signup/t.co
-    links), and 3 junk messages hit the group.
-  - **Reply filtering** (added Jul 22 2026 after two of Ornstein's
-    credit-replies hit the group): the group wants scoops and RTs, NOT
-    reply-thread chatter. Three layers, because no single source sees all
-    replies: (1) nitter RSS titles replies "R to @user:" — covers replies
-    to others AND self-thread replies; (2) nitter HTML marks replies to
-    others with a `replying-to` class — but NOT self-replies; (3) before
-    actually posting, `is_reply_via_api()` confirms via
-    `api.fxtwitter.com/status/<id>` (fail-OPEN: if that API is down, post
-    anyway — a missed scoop is worse than a stray reply). Reply flags stick
-    through the merge (an unflagged HTML copy must not launder the RSS
-    flag). Tradeoff, deliberate: substantive self-thread CONTINUATIONS are
-    also skipped — the group reads the original scoop and can tap through.
-    Replies are marked seen, so they never resurface.
-  - Fingerprints are the tweet's numeric status ID, extracted from any source's
-    link format — the same tweet dedupes identically across feed sources.
-  - `MAX_TWEET_AGE_HOURS = 24`: entries older than 24h are marked seen but
-    never posted, so a recovering rich feed can't flood the group with stale
-    news. Tradeoff: if ALL feeds are dead for >24h, that window's tweets are
-    silently dropped.
-  - `send_telegram()` canonicalizes any mirror's link (nitter.net, xcancel,
-    etc.) to `fixupx.com/<user>/status/<id>` — never post a raw mirror URL.
-- **GitHub Actions cron is unreliable in practice.** Observed: 2 runs in 12
-  hours on a `*/5` schedule (Jul 9 2026). This is GitHub's infra, not a config
-  bug — and is the main motivation for the VPS migration.
-- **Self-inflicted SSH lockout, Aug 19 2026 (~50 min, bot unaffected).** A
-  discretionary SSH port change — sole benefit: quieter logs — broke the
-  socket-activated SSH unit; the listener came back on neither restart nor
-  reboot. Recovery needed a root password reset and the VNC Recovery Console.
-  The bot posted normally throughout; only access was lost. Full technical
-  detail and the recovery runbook live in `VPS.md` (bearishninja/vps). The
-  behavioural fallout is the "Rules for touching the droplet" in Hard rules
-  below, enforced by `.claude/hooks/guard-droplet.sh`.
+**Removed on purpose — do not rebuild:** a stale-feed watchdog that compared a
+third-party Telegram mirror channel (`t.me/David_Ornstein`) against our newest
+tweet. Its two real catches are now handled automatically by dual-mode
+fetching, hourly pool refresh, and the sweep self-heal. After that it only
+produced false alarms, because that channel posts **paid ads** — and an ad is
+permanently "newer" than our latest tweet, so it defeated both a 45-minute
+persistence check and a daily rate limit, ultimately paging the owner about a
+music promo while feeds were perfectly healthy. **Lesson: an alert that cannot
+be acted on is worse than no alert, because it trains the owner to ignore the
+ones that matter.**
 
-## Production deployment: DigitalOcean droplet (since Jul 10 2026)
+## Incident log (condensed — the safeguards above are the durable output)
 
-The bot now runs on the owner's personal droplet. GitHub Actions remains as a
-disabled fallback workflow (see below).
+| Date | What happened | Outcome |
+|---|---|---|
+| Jul 9 | Tweet missed ~6.5h: GitHub cron ran twice in 12h **and** every feed was dead | Feed list rebuilt around nitter.net; decision to move to a VPS |
+| Jul 13 | Nitter blipped, a scraper "won" with X login-page links → 3 junk messages in the group | `is_tweet_entry()` |
+| Jul 15 | nitter.net RSS went rich-but-STALE for 27h+ while an rss-less instance had the tweet fresh in HTML | Dual-mode fetching + merge |
+| Jul 16 | A 6h-old top-6 pool snapshot excluded the only fresh instance | Hourly refresh, no top-N cutoff, sweep self-heal |
+| Jul 15 | A manual salvage post raced an in-flight run → same tweet twice, seconds apart | Runbook: drain the service before manual posting |
+| Jul 22 | Two of Ornstein's credit-replies posted to the group | Reply filtering (3 layers) |
+| Aug 3 | DigitalOcean suspended the droplet for non-payment; ~73 min silent outage | healthchecks.io heartbeat; billing alerts |
+| Aug 19 | **Self-inflicted:** a discretionary SSH port change (sole benefit: quieter logs) broke socket-activated SSH; ~50 min of no access, bot unaffected | "Rules for touching the droplet" + `guard-droplet.sh` hook |
+| Aug 20 | Watchdog paged the owner about an advert in the mirror channel | Watchdog retired |
+| Aug 20 | Measured 18 of 20 source probes failing identically every minute (~26k wasted requests/day) | Two-tier probing; dead sources pruned |
+
+Live source status any time: `python check_feeds.py`.
+
+## Production deployment: the droplet (detail)
 
 - **Droplet:** `bearishninja-services` — DigitalOcean Basic $6/mo (1GB RAM,
   1 vCPU, 25GB SSD), Ubuntu 24.04 LTS, Bangalore region.
@@ -282,10 +290,15 @@ everything seen, no spam.
 ## Coding conventions / preferences
 
 - Keep `bot.py` a single self-contained script. Simplicity beats cleverness here.
-- Every feed source should log its entry count (`  <url> → N entries`) so the
-  owner can eyeball which mirrors are alive from the Actions logs.
+- **Log by exception, not by default.** A healthy cycle is 3 lines. Per-source
+  detail appears on full sweeps and whenever a *proven* source stops yielding —
+  the actionable cases. Logging all ~20 sources every minute produced ~43k
+  lines/day and left only ~6 days of journal history under the 200 MB cap.
+  Use `python check_feeds.py` when you want a full picture on demand.
 - Fail soft: one dead feed host must never crash the run or block the others.
 - Never post without deduping against `state.json`.
+- Prove a source works before adding it, and remove sources that have stopped
+  earning their request (measure over dozens of cycles, not one).
 
 ## Hard rules (do not violate)
 

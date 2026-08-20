@@ -4,49 +4,59 @@ Forwards new tweets from [@David_Ornstein](https://x.com/David_Ornstein) into th
 **BMS FC** Telegram group, with a fully-rendered preview card (text, images,
 video) so everyone can read and reply without leaving Telegram.
 
-**Runs on a personal VPS via systemd timer — no Twitter API keys.**
+**Runs on a personal VPS via a systemd timer — no Twitter API keys, no cost
+beyond the box.**
 
 ---
 
 ## How it works
 
 Every minute, a systemd timer on the owner's DigitalOcean droplet runs
-`bot.py`, which checks public RSS feeds of Ornstein's tweets (nitter.net et
-al), finds any it hasn't posted yet, and sends each to the group as a
-`fixupx.com` link — which Telegram renders as a rich card. A local
-`state.json` remembers what's already been posted so nothing repeats.
+`bot.py`. It reads Ornstein's tweets from public nitter mirrors (RSS *and*
+scraped HTML timelines), merges everything it finds, drops replies and
+anything it has already posted, and sends the rest to the group as
+`fixupx.com` links — which Telegram renders as rich cards. A local
+`state.json` remembers what's been posted.
 
-(An earlier GitHub Actions version is kept as a disabled fallback workflow —
-see `CLAUDE.md` for the full story and runbook.)
+Typical delivery: **1–3 minutes** after he tweets. The remaining delay is the
+mirrors' own refresh rate, not the polling interval.
 
-## Setup
+`CLAUDE.md` has the full architecture, the safeguards and why each exists, the
+incident log, and the droplet runbook.
 
-See `CLAUDE.md` for full architecture and history. Quick version:
+## Operating it
 
-1. **Secrets** — in repo Settings → Secrets and variables → Actions:
-   - `TELEGRAM_BOT_TOKEN` — from @BotFather
-   - `TELEGRAM_CHAT_ID` — the group ID (negative number)
-2. **Deploy** — it's already wired. The workflow runs every 5 minutes.
-3. **Test** — Actions tab → "Tweet Forwarder" → Run workflow → check the logs.
+```bash
+# which sources are alive right now (no secrets needed)
+pip install -r requirements.txt && python check_feeds.py
 
-## Working on this with Claude Code
+# on the droplet
+journalctl -u ornstein-bot.service -n 50     # recent activity
+systemctl list-timers ornstein-bot.timer     # is the schedule alive?
+systemctl start ornstein-bot.service         # force one run
+```
 
-See `GETTING_STARTED.md` for how to install Claude Code and start iterating on
-this project hands-free (Claude Code commits and pushes for you).
+A healthy cycle logs three lines. Per-source detail appears on the periodic
+full sweep, or whenever a source that was working stops.
+
+## Monitoring
+
+You get told when something breaks, rather than having to check:
+
+- **All sources dead for 2h** → Telegram DM to the owner.
+- **Box, network, timer or script dead** → email from healthchecks.io, which
+  alerts on *silence* and so survives the box dying.
 
 ## Customisation
 
-- Track a different account: set repo variable `TWITTER_USERNAME`.
-- Change frequency: edit the `cron` in `.github/workflows/tweet-check.yml`
-  (note: GitHub's minimum is every 5 minutes).
+- Track a different account: set `TWITTER_USERNAME` in
+  `/opt/ornstein-bot/.env`.
+- Feed sources, thresholds and the sweep interval are constants at the top of
+  `bot.py`.
 
-## Troubleshooting
+## Fallback
 
-- **Posting nothing?** Run the workflow manually and read the logs. Each feed
-  source reports its entry count; if all show `0 entries`, the feed sources are
-  down and need refreshing (see `CLAUDE.md` → Known issues).
-- **Check feed health yourself:** `pip install -r requirements.txt && python
-  check_feeds.py` — hits every feed source and prints which ones are up, down,
-  or empty. No secrets or env vars needed.
-- **Duplicates?** Shouldn't happen with the current workflow. If it does, check
-  that the cache steps in the workflow still use the unique-key pattern.
+The original GitHub Actions workflow is kept but **disabled**, so the two can't
+double-post. If the droplet dies, re-enable it from the Actions tab for
+immediate (if slower) coverage — its state cache starts empty, so the first run
+safely marks everything seen instead of spamming.
