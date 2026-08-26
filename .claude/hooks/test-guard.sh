@@ -50,6 +50,11 @@ check BLOCK "sudo reboot"
 check BLOCK "reboot"
 check BLOCK "echo done; poweroff"
 
+echo "--- must ALLOW: read-only checks that merely MENTION power words ---"
+check ALLOW "ssh $HOST '[ -f /var/run/reboot-required ] && echo pending || echo none'"
+check ALLOW "ssh $HOST 'journalctl --list-boots | tail -3'"
+check ALLOW "ssh $HOST 'ls -la /var/run/reboot-required'"
+
 echo "--- must ALLOW: routine droplet ops ---"
 check ALLOW "ssh $HOST 'uptime; free -h; df -h /'"
 check ALLOW "ssh $HOST 'ufw status'"
