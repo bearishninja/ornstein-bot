@@ -32,7 +32,7 @@ quote-reply *without leaving Telegram or clicking through to X*.
 ## How it works (architecture)
 
 ```
-systemd timer on the droplet (every minute)
+systemd timer on the droplet (every 2 min, +0-25s jitter)
         │
         ▼
    bot.py runs once, exits
@@ -49,12 +49,13 @@ systemd timer on the droplet (every minute)
         └─ done (process exits)
 ```
 
-- **No Twitter/X API keys.** Public RSS feeds and scraped nitter HTML only.
+- **Primary source is X itself**, read with a burner account's session (see
+  "First-party X source"). The dead nitter mirrors remain as fallback only.
 - **Runs on the owner's DigitalOcean droplet** via a systemd timer, not on
   GitHub Actions (that was the original design; the workflow is now a disabled
   fallback — see Deployment). State is a local `state.json`, gitignored.
-- **~1-3 min latency** end to end, bounded by the upstream feeds' own refresh
-  rate rather than by our polling.
+- **~1-2.5 min latency**, now essentially just the polling interval — the
+  mirror scrape-lag is gone (see "Latency reality").
 
 ### Two-tier probing (added Aug 20 2026 — keep this)
 
@@ -108,7 +109,7 @@ box-wide conventions in the "Production deployment" section below and in the
 
 - **Repo:** `bearishninja/ornstein-bot` (GitHub, public — note it documents the
   droplet's IP and layout; no secrets, but see "Note" at the end).
-- **Trigger:** `ornstein-bot.timer` fires `ornstein-bot.service` every minute.
+- **Trigger:** `ornstein-bot.timer` fires `ornstein-bot.service` every 2 min.
 - **Secrets:** `/opt/ornstein-bot/.env` on the droplet (chmod 600).
 - **Fallback:** the GitHub Actions workflow is kept but **disabled** so the two
   can't double-post. Re-enable from the Actions tab if the droplet dies.
