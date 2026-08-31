@@ -131,6 +131,46 @@ observed gaps of 3-5 HOURS), which is why the bot moved to the droplet. If
 someone asks for faster delivery, the honest answer is that it needs a better
 data source (a logged-in X session or the paid API), not a faster loop.
 
+## First-party X source (primary since Aug 31 2026)
+
+**The free mirror ecosystem is gone.** `nitter.net` answers **410 Gone**, the
+community tracker (`status.d420.de`) lists **zero** instances, and every other
+instance 403s/404s this droplet. The bot was blind for ~6 days (Aug 25 20:50 →
+Aug 31 15:41) and roughly a dozen tweets went undelivered — including
+deadline-week scoops. No amount of merging, discovery or probing helps when
+there are no mirrors left, so the source layer changed.
+
+The bot now reads the timeline **directly from X** using a dedicated (burner)
+account's session cookie:
+
+- Env: `X_AUTH_TOKEN` + `X_CT0` in `/opt/ornstein-bot/.env` (chmod 600).
+  Both MUST come from the same browser session — `ct0` is bound to that
+  `auth_token`.
+- Endpoint: `UserOriginalsTimeline` GraphQL, query id in `X_QUERY_ID`. The
+  bearer in `X_BEARER` is the constant X ships in its own web frontend, not a
+  secret.
+- It is the **first** source in `build_sources()` when configured; the dead
+  mirrors stay in the list, so this is additive — a dead session degrades to
+  the old (currently useless) behaviour rather than breaking, and the
+  dead-feed alert still fires.
+- Entries are shaped like every other fetcher, so merge, dedup by status ID,
+  reply filtering, the 24h age cutoff and fixupx canonicalisation all apply
+  unchanged. X's own `in_reply_to_status_id_str` gives an authoritative reply
+  flag — better than the heuristics the mirrors needed.
+
+**Refreshing the session** (it will expire, and the account may eventually be
+suspended — automated access is against X's ToS, a tradeoff the owner accepted
+knowingly):
+1. Log the burner account into a browser (a normal window, not private —
+   private windows do not persist cookies).
+2. DevTools → Application/Storage → Cookies → `https://x.com`.
+3. Copy `auth_token` and `ct0`, replace both in `.env`, done. No restart
+   needed; the next cycle picks them up.
+
+Symptom of a dead session: the `[x]` source logs
+`HTTP 401 (session may need refreshing)`. **Do not** guess at a new query id
+if it logs 0 tweets — read the current one off a live web session.
+
 ## Safeguards (keep these — each one exists because of a real incident)
 
 Feed fragility is the #1 ongoing risk. Everything below is load-bearing; the
@@ -205,6 +245,7 @@ ones that matter.**
 | Aug 19 | **Self-inflicted:** a discretionary SSH port change (sole benefit: quieter logs) broke socket-activated SSH; ~50 min of no access, bot unaffected | "Rules for touching the droplet" + `guard-droplet.sh` hook |
 | Aug 20 | Watchdog paged the owner about an advert in the mirror channel | Watchdog retired |
 | Aug 20 | Measured 18 of 20 source probes failing identically every minute (~26k wasted requests/day) | Two-tier probing; dead sources pruned |
+| Aug 25-31 | **Mirror ecosystem collapsed** (nitter.net → 410 Gone, tracker empty); bot blind ~6 days, ~12 tweets missed | First-party X source via a burner account session |
 
 Live source status any time: `python check_feeds.py`.
 
@@ -219,8 +260,9 @@ Live source status any time: `python check_feeds.py`.
   TELEGRAM_CHAT_ID, TWITTER_USERNAME, and optionally TELEGRAM_ALERT_CHAT_ID
   (the owner's private chat with the bot, for outage DMs — the owner must
   /start a private chat with @ornstein_alerts_bot once; find the chat id via
-  the Telegram getUpdates API) and HEALTHCHECK_URL (see below). Never in
-  the repo.
+  the Telegram getUpdates API), HEALTHCHECK_URL (see below), and
+  X_AUTH_TOKEN / X_CT0 (the burner X account session — see "First-party X
+  source"). Never in the repo.
 - **External heartbeat** (added Aug 3 2026): `ping_heartbeat()` hits the
   healthchecks.io URL in `HEALTHCHECK_URL` after every run that completes
   without raising. healthchecks.io alerts by email on SILENCE (period 5
