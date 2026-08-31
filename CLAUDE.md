@@ -122,9 +122,16 @@ box-wide conventions in the "Production deployment" section below and in the
 
 ## Latency reality (don't re-litigate)
 
-Delivery is ~1-3 min after Ornstein tweets, and the remaining delay is **the
-upstream feeds' own refresh rate**, not our scheduler — the timer already runs
-every minute. Polling faster buys nothing.
+Delivery is ~1-3 min after Ornstein tweets. Since the switch to the
+first-party X source there is no mirror scrape-lag left, so latency is now
+essentially just the polling interval: 2 min cadence + up to 25s jitter, i.e.
+worst case ~2.5 min, average ~1.2 min. Measured on the 1-minute cadence
+immediately after the switch: **62 seconds** end to end.
+
+The 2-minute cadence is a deliberate trade for a lower ban risk on the burner
+account, not a technical limit. Reverting to 1 min (delete
+`ornstein-bot.timer.d/interval.conf`) roughly halves the latency and doubles
+the request footprint.
 
 Historical note: on GitHub Actions this was far worse (cron floor of 5 min, and
 observed gaps of 3-5 HOURS), which is why the bot moved to the droplet. If
@@ -274,8 +281,18 @@ Live source status any time: `python check_feeds.py`.
   tying them together would email "box down" during a mere feed outage.
   Fail-soft and env-gated: unset (e.g. on GitHub Actions) = no-op.
 - **Scheduling:** systemd timer `ornstein-bot.timer` fires
-  `ornstein-bot.service` (oneshot, runs `bot.py` once) **every minute**.
-  Unit files: `/etc/systemd/system/ornstein-bot.{service,timer}`.
+  `ornstein-bot.service` (oneshot, runs `bot.py` once) **every 2 minutes**,
+  with up to 25s of random jitter. Unit files:
+  `/etc/systemd/system/ornstein-bot.{service,timer}`, plus two drop-ins in
+  `ornstein-bot.timer.d/`:
+  - `interval.conf` — 2-minute cadence (was 1 min until Aug 31 2026). Halves
+    the request footprint against X (~1440 → ~720/day) to lower the burner
+    account's ban risk. Delete the file + daemon-reload to revert to 1 min.
+  - `jitter.conf` — `RandomizedDelaySec=25`, so requests are not perfectly
+    periodic on the minute (a machine fingerprint). Costs ~12s average latency.
+
+  Both are drop-ins deliberately: the shipped unit stays untouched and either
+  change is reverted by deleting one file.
 - **State:** `/opt/ornstein-bot/state.json` on local disk. Fingerprints are
   numeric tweet status IDs.
 - **Box hardening (done):** ufw (OpenSSH+80+443 only), fail2ban,
