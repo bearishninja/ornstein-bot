@@ -25,6 +25,7 @@ import time
 import logging
 import hashlib
 import calendar
+import urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -93,6 +94,29 @@ REALERT_HOURS = 24
 # Feeds that respond slower than this are skipped so one dead host can't stall
 # the whole run. Fetches run in parallel, so this bounds the whole fetch step.
 FEED_TIMEOUT = 12  # seconds
+
+# ── First-party X source (added Aug 31 2026) ────────────────────────────────
+# The free nitter/mirror ecosystem collapsed: nitter.net now answers 410 Gone
+# and the community tracker lists zero instances. A dedicated (burner) X
+# account's session cookie lets us read the timeline directly, which is
+# immune to other people's rate limits. Env-gated and fail-soft: if the
+# session dies the bot silently falls back to whatever mirrors respond, and
+# the dead-feed alert fires as usual.
+#
+# Refreshing the session (when the cookie expires or the account is
+# suspended): log the burner into a browser, copy the `auth_token` and `ct0`
+# cookies for x.com, and replace X_AUTH_TOKEN / X_CT0 in .env. Both must come
+# from the SAME browser session — ct0 is bound to that auth_token.
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "")
+X_CT0 = os.getenv("X_CT0", "")
+X_USER_ID = os.getenv("X_USER_ID", "46875124")   # @David_Ornstein numeric id
+# Public web-client bearer (a constant X ships in its own frontend, not a secret)
+X_BEARER = ("AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs="
+            "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA")
+# GraphQL query id for UserOriginalsTimeline, observed in a live web session.
+# If X rotates it this source starts returning 0 tweets — check a live session
+# for the current id rather than guessing.
+X_QUERY_ID = "jcbfqPu_2XMNOwVyGypRhw"
 
 TWITTER_EPOCH_MS = 1288834974657  # snowflake ID → timestamp
 
@@ -208,6 +232,8 @@ def build_sources(state: dict) -> list:
     what caught the Jul 15 2026 stale-nitter.net incident). Dynamic
     instances first, then static fallbacks, deduped."""
     sources = []
+    if X_AUTH_TOKEN and X_CT0:
+        sources.append(("x", "x.com/i/api/graphql"))   # primary when configured
     for inst in state["instances"]:
         sources.append(("rss", f"{inst}/{TWITTER_USERNAME}/rss"))
         sources.append(("html", f"{inst}/{TWITTER_USERNAME}"))
@@ -269,10 +295,99 @@ def parse_nitter_html(content: str) -> list:
     return entries
 
 
+def fetch_x_timeline() -> tuple:
+    """Read the timeline straight from X using the dedicated account's session.
+    Returns (status_line, entries) shaped exactly like the other fetchers so
+    the merge, dedup, reply filter and age cutoff all apply unchanged."""
+    features = {
+        "rweb_video_screen_enabled": False, "rweb_cashtags_enabled": True,
+        "profile_label_improvements_pcf_label_in_post_enabled": True,
+        "responsive_web_profile_redirect_enabled": True,
+        "rweb_tipjar_consumption_enabled": False, "verified_phone_label_enabled": True,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_timeline_navigation_enabled": True,
+        "premium_content_api_read_enabled": False,
+        "communities_web_enable_tweet_community_results_fetch": True,
+        "c9s_tweet_anatomy_moderator_badge_enabled": True,
+        "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+        "responsive_web_grok_analyze_post_followups_enabled": True,
+        "rweb_cashtags_composer_attachment_enabled": True,
+        "responsive_web_jetfuel_frame": True,
+        "responsive_web_grok_share_attachment_enabled": True,
+        "responsive_web_grok_annotations_enabled": True,
+        "articles_preview_enabled": True, "responsive_web_edit_tweet_api_enabled": True,
+        "rweb_conversational_replies_downvote_enabled": False,
+        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+        "view_counts_everywhere_api_enabled": True,
+        "longform_notetweets_consumption_enabled": True,
+        "responsive_web_twitter_article_tweet_consumption_enabled": True,
+        "content_disclosure_indicator_enabled": True,
+        "content_disclosure_ai_generated_indicator_enabled": True,
+        "responsive_web_grok_show_grok_translated_post": True,
+        "responsive_web_grok_analysis_button_from_backend": True,
+        "post_ctas_fetch_enabled": False,
+        "freedom_of_speech_not_reach_fetch_enabled": True,
+        "standardized_nudges_misinfo": True,
+        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+        "longform_notetweets_rich_text_read_enabled": True,
+        "longform_notetweets_inline_media_enabled": False,
+        "responsive_web_grok_image_annotation_enabled": True,
+        "responsive_web_grok_imagine_annotation_enabled": True,
+        "responsive_web_grok_community_note_auto_translation_is_enabled": True,
+        "responsive_web_enhance_cards_enabled": False,
+    }
+    variables = {"userId": X_USER_ID, "count": 20, "includePromotedContent": False,
+                 "withQuickPromoteEligibilityTweetFields": False, "withVoice": True}
+    url = (f"https://x.com/i/api/graphql/{X_QUERY_ID}/UserOriginalsTimeline"
+           f"?variables={urllib.parse.quote(json.dumps(variables))}"
+           f"&features={urllib.parse.quote(json.dumps(features))}"
+           f"&fieldToggles={urllib.parse.quote(json.dumps({'withArticlePlainText': False}))}")
+    resp = requests.get(url, timeout=FEED_TIMEOUT, headers={
+        "authorization": "Bearer " + X_BEARER,
+        "x-csrf-token": X_CT0,
+        "cookie": f"auth_token={X_AUTH_TOKEN}; ct0={X_CT0}",
+        "user-agent": BROWSER_UA["User-Agent"],
+        "x-twitter-active-user": "yes",
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-client-language": "en",
+    })
+    if not resp.ok:
+        # 401/403 here almost always means the session died or the account was
+        # suspended — refresh the cookies (see the config block above).
+        return f"HTTP {resp.status_code} (session may need refreshing)", []
+
+    entries, seen_ids = [], set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("__typename") == "Tweet" and "legacy" in node:
+                sid = node.get("rest_id")
+                lg = node["legacy"]
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    entries.append({
+                        "id": sid,
+                        "link": f"https://x.com/{TWITTER_USERNAME}/status/{sid}",
+                        "published_parsed": time.gmtime(
+                            ((int(sid) >> 22) + TWITTER_EPOCH_MS) / 1000),
+                        "is_reply": bool(lg.get("in_reply_to_status_id_str")),
+                    })
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(resp.json())
+    return f"{len(entries)} tweets (first-party)", entries
+
+
 def fetch_one(source: tuple):
     """Fetch one (kind, url) source; returns (status_line, valid_tweet_entries)."""
     kind, url = source
     try:
+        if kind == "x":
+            return fetch_x_timeline()
         if kind == "html":
             resp = requests.get(url, timeout=FEED_TIMEOUT, headers=BROWSER_UA)
             if not resp.ok:
