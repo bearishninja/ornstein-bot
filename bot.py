@@ -117,6 +117,10 @@ X_BEARER = ("AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs="
 # If X rotates it this source starts returning 0 tweets — check a live session
 # for the current id rather than guessing.
 X_QUERY_ID = "jcbfqPu_2XMNOwVyGypRhw"
+# Set when X rejects the session (401/403). Surfaced immediately rather than
+# waiting for the 2h dead-feed alert: with the mirrors dead, a rejected
+# session means the bot is blind RIGHT NOW and only a cookie refresh fixes it.
+X_SESSION_REJECTED = None
 
 TWITTER_EPOCH_MS = 1288834974657  # snowflake ID → timestamp
 
@@ -144,6 +148,7 @@ def load_state() -> dict:
     state.setdefault("last_alert", 0)
     state.setdefault("proven", [])       # "kind|url" of sources that yielded
     state.setdefault("last_sweep", 0)
+    state.setdefault("last_x_alert", 0)
     # Inert leftovers from the retired mirror watchdog — drop on next write.
     state.pop("watchdog_last_alert", None)
     state.pop("watchdog_stale_since", None)
@@ -354,6 +359,9 @@ def fetch_x_timeline() -> tuple:
     if not resp.ok:
         # 401/403 here almost always means the session died or the account was
         # suspended — refresh the cookies (see the config block above).
+        global X_SESSION_REJECTED
+        if resp.status_code in (401, 403):
+            X_SESSION_REJECTED = resp.status_code
         return f"HTTP {resp.status_code} (session may need refreshing)", []
 
     entries, seen_ids = [], set()
@@ -583,6 +591,19 @@ def main():
     if sweep:
         state["proven"] = productive
         state["last_sweep"] = time.time()
+
+    # A rejected X session is the one failure a cookie refresh fixes, so say so
+    # at once instead of letting the generic 2h dead-feed alert cover for it.
+    if X_SESSION_REJECTED and (time.time() - state["last_x_alert"]) > REALERT_HOURS * 3600:
+        state["last_x_alert"] = time.time()
+        send_owner_alert(
+            f"⚠️ ornstein-bot: X rejected the account session "
+            f"(HTTP {X_SESSION_REJECTED}) — the burner is likely suspended or the "
+            f"cookie expired, and the mirror sources are dead, so the bot is blind "
+            f"until it is refreshed. Fix: log the burner into a browser, copy the "
+            f"auth_token and ct0 cookies for x.com, replace X_AUTH_TOKEN / X_CT0 "
+            f"in /opt/ornstein-bot/.env."
+        )
 
     check_feed_health(state, any_rich)
 
