@@ -45,6 +45,16 @@ deny() {
   exit 0
 }
 
+# Known READ-ONLY phrases that merely CONTAIN a dangerous word. Stripped before
+# the power checks so that *inspecting* power state is never mistaken for
+# *changing* it (e.g. `[ -f /var/run/reboot-required ]`). Only add things here
+# that cannot possibly alter the machine.
+SCRUBBED=$(printf '%s' "$CMD" \
+  | sed -e 's#/var/run/reboot-required##g' \
+        -e 's#reboot-required##g' \
+        -e 's#--list-boots##g' \
+        -e 's#needs-restarting##g')
+
 # Does this command actually reach the droplet?
 TARGETS_DROPLET=0
 if grep -qE "$DROPLET_IP|(^|[[:space:];&|(])(ssh|scp|rsync|sftp)[[:space:]]" <<<"$CMD"; then
@@ -71,7 +81,7 @@ if [ "$TARGETS_DROPLET" = "1" ]; then
     deny "BLOCKED: changes system accounts or passwords on the droplet. Account/auth changes belong to the owner."
 
   # --- Power ----------------------------------------------------------------
-  grep -qiE '\b(reboot|shutdown|poweroff|halt)\b|systemctl[[:space:]]+(reboot|poweroff|halt|kexec)|\binit[[:space:]]+[06]\b' <<<"$CMD" && \
+  grep -qiE '\b(reboot|shutdown|poweroff|halt)\b|systemctl[[:space:]]+(reboot|poweroff|halt|kexec)|\binit[[:space:]]+[06]\b' <<<"$SCRUBBED" && \
     deny "BLOCKED: changes the droplet's power state. Reboots are the owner's call (DigitalOcean panel → Power). For boot history use 'journalctl --list-boots' instead of 'last -x reboot'."
 fi
 
@@ -79,7 +89,7 @@ fi
 # Must sit at a command position AND be followed by end-of-command, a shell
 # separator, or a flag — so prose like "…; reboot is the owner's call" inside a
 # doc edit is not mistaken for an instruction to reboot anything.
-grep -qE '(^|[;&|]|\$\()[[:space:]]*(sudo[[:space:]]+)?(reboot|shutdown|poweroff|halt)([[:space:]]*($|[;&|])|[[:space:]]+-)' <<<"$CMD" && \
+grep -qE '(^|[;&|]|\$\()[[:space:]]*(sudo[[:space:]]+)?(reboot|shutdown|poweroff|halt)([[:space:]]*($|[;&|])|[[:space:]]+-)' <<<"$SCRUBBED" && \
   deny "BLOCKED: power-state command. If a machine genuinely needs restarting, ask the owner to do it."
 
 exit 0
