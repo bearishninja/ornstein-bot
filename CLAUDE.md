@@ -119,7 +119,9 @@ box-wide conventions in the "Production deployment" section below and in the
 - Target group chat ID: `-1001510845978` (group "BMS FC").
 - Owner's private chat with the bot receives outage DMs
   (`TELEGRAM_ALERT_CHAT_ID`).
-- Bot must remain a member of the group with permission to post.
+- Bot must be a member of the group with permission to post. **It was
+  removed on Sep 2 2026 while paused** — re-add before resuming (see the
+  PAUSED section).
 
 ## Latency reality (don't re-litigate)
 
@@ -148,11 +150,37 @@ restart of the box does not silently resume it), and the X session cookies in
 an unused live session is pointless exposure. Everything else is untouched:
 code, unit files, and `state.json` (~185 seen ids) are all in place.
 
+The bot was also **removed from the "BMS FC" Telegram group** — it must be
+re-added before it can post again (step 0 below).
+
 Nothing about the bot is broken. Do not debug it — it is off on purpose.
 
 ### Resume, in order
 
-**1. Refresh the X session first. Assume the old one is dead.** After four
+**0. Re-add the bot to the Telegram group — do this FIRST.** The owner removed
+`@ornstein_alerts_bot` from "BMS FC" on Sep 2 2026 when parking it. Add it back
+as a member (needs someone with admin rights on the group) before starting the
+timer.
+
+Why this is step 0: if it is missing, `sendMessage` fails with **HTTP 403
+"bot was kicked from the group chat"**, which reads exactly like a dead token
+and sends you debugging credentials that are perfectly fine. A 403 from
+*api.telegram.org* means MEMBERSHIP; a 401/403 from *x.com* means the X
+session (step 1). Different things, similar-looking symptoms.
+
+The group's chat id (`-1001510845978`) is unchanged by removal and re-adding,
+so `TELEGRAM_CHAT_ID` needs no edit. Verify with a harmless direct call before
+starting the timer:
+
+```bash
+set -a; . /opt/ornstein-bot/.env; set +a
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+  -H 'Content-Type: application/json' \
+  -d "{\"chat_id\":\"$TELEGRAM_CHAT_ID\",\"text\":\"test\"}"
+```
+`{"ok":true}` means membership and permissions are good.
+
+**1. Refresh the X session. Assume the old one is dead.** After four
 months the cookies have certainly expired and the burner may be suspended.
 - Log a burner account into a browser — a **normal window, not private**
   (private windows do not persist cookies).
