@@ -139,6 +139,79 @@ observed gaps of 3-5 HOURS), which is why the bot moved to the droplet. If
 someone asks for faster delivery, the honest answer is that it needs a better
 data source (a logged-in X session or the paid API), not a faster loop.
 
+## ⏸ PAUSED (Sep 2 2026) — how to resume in January
+
+The transfer window closed Sep 1 2026, so the bot was paused until the January
+window. `ornstein-bot.timer` is **stopped and disabled** (disabled, so a
+restart of the box does not silently resume it), and the X session cookies in
+`/opt/ornstein-bot/.env` were **blanked** — they would have expired anyway and
+an unused live session is pointless exposure. Everything else is untouched:
+code, unit files, and `state.json` (~185 seen ids) are all in place.
+
+Nothing about the bot is broken. Do not debug it — it is off on purpose.
+
+### Resume, in order
+
+**1. Refresh the X session first. Assume the old one is dead.** After four
+months the cookies have certainly expired and the burner may be suspended.
+- Log a burner account into a browser — a **normal window, not private**
+  (private windows do not persist cookies).
+- DevTools (`Cmd+Option+I`) → **Storage** (Firefox) or **Application**
+  (Chrome) → **Cookies** → `https://x.com`. There is a filter box; type
+  `auth` to find the row.
+- Copy `auth_token` **and** `ct0` — they must come from the **same session**,
+  because `ct0` is bound to that `auth_token`.
+- Put both in `/opt/ornstein-bot/.env` (`chmod 600`). No restart needed.
+- **Do not log out afterwards** — that invalidates the token. Just close the
+  window.
+- If the account is suspended: make a new one (spare email, follow
+  @David_Ornstein plus a few other football accounts, scroll for a moment so
+  it is not a zero-activity account), then repeat.
+
+**2. Re-verify `X_QUERY_ID` — the likeliest thing to have rotted.** X rotates
+its GraphQL query ids and renames operations without notice.
+- With the burner logged in, open DevTools → **Network**, load
+  `x.com/David_Ornstein`, and find the profile-timeline GraphQL request.
+- The id is the path segment in
+  `/i/api/graphql/<QUERY_ID>/<OperationName>`. Note the **operation name may
+  have changed** too (it was `UserOriginalsTimeline` in Aug 2026) — if so,
+  update the URL in `fetch_x_timeline()`, not just the id.
+- **Never guess a query id.** Read it off a live session.
+
+**3. Know which failure you are looking at** — the log line tells you:
+| Symptom | Cause | Fix |
+|---|---|---|
+| `HTTP 401` / `403` | session dead or account suspended | step 1 |
+| `HTTP 404` / `400`, or 200 with 0 tweets | query id or operation renamed | step 2 |
+
+**4. Start it:** `systemctl enable --now ornstein-bot.timer`, then check a
+cycle logs `[x] x.com/i/api/graphql → N tweets (first-party)`.
+
+**5. The first run is safe.** `state.json` still holds the old `seen` ids, and
+`MAX_TWEET_AGE_HOURS = 24` marks anything older as seen *without posting* — so
+four months of backlog cannot flood the group.
+
+**6. healthchecks.io** was paused in its web UI at shutdown; it **resumes
+automatically** on the first ping. If it was never paused, expect months of
+daily "down" emails — check and clear them.
+
+**7. Re-check the source layer before trusting it.** The nitter mirrors in
+`STATIC_FEEDS` were already dead in Aug 2026 (nitter.net → 410 Gone) and are
+almost certainly still dead; the X session is the only real source. If X has
+closed this path too, the fallback is a paid API (twitterapi.io was ~$0.15 per
+1,000 tweets — roughly 50¢/month at his volume).
+
+### Known gaps to consider on resume (not bugs)
+
+- **Retweets are not forwarded.** `UserOriginalsTimeline` returns only his own
+  posts; verified 0 retweets in 23 entries. The mirror era did carry them. If
+  the group wants them back, the option is reading the burner's **home**
+  timeline (it follows only Ornstein plus a few accounts) and filtering by
+  author — more moving parts, deliberately not built.
+- **Only one session, no rotation.** Two or more burner sessions rotated per
+  cycle would halve per-account load and survive a single suspension. Also not
+  built: today there is one session, and the (dead) mirrors behind it.
+
 ## First-party X source (primary since Aug 31 2026)
 
 **The free mirror ecosystem is gone.** `nitter.net` answers **410 Gone**, the
